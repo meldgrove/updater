@@ -76,6 +76,11 @@ pass "check prints the digest of a local image"
 got=$(docker run --rm --env IMAGE=ghcr.io/meldgrove/reimbursements:latest "$image" check)
 [[ $got =~ ^sha256:[0-9a-f]{64}$ ]] || fail "check printed '$got' for a public GHCR image"
 pass "check signs in to GHCR anonymously"
+for name in alpine:3 docker.io/library/alpine:3; do
+  got=$(docker run --rm --env IMAGE="$name" "$image" check)
+  [[ $got =~ ^sha256:[0-9a-f]{64}$ ]] || fail "check printed '$got' for $name"
+done
+pass "check reads Docker Hub, with and without docker.io"
 
 # Without a deploy link the updater only says it is off.
 run --env IMAGE="$app"
@@ -111,7 +116,8 @@ pass "a moved tag deploys once, with POST and the bearer token"
 echo 401 > "$state/status"
 publish 3
 eventually 15 calls_at_least 3 || fail "a refused deployment was not tried again"
-logged "answered HTTP 401" || fail "the refusal was not logged"
+logged "answered HTTP 401." || fail "the refusal was not logged"
+! logged "Unauthenticated" || fail "the deploy link's answer was logged"
 echo 200 > "$state/status"
 sleep 3
 settled=$(calls)

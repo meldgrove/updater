@@ -50,6 +50,7 @@ case ${name%%/*} in
   *.* | *:* | localhost) registry=${name%%/*} repository=${name#*/} ;;
   *) registry=registry-1.docker.io repository=$name ;;
 esac
+case $registry in docker.io | index.docker.io) registry="registry-1.docker.io" ;; esac
 if [ "$registry" = registry-1.docker.io ] && [ "${repository#*/}" = "$repository" ]; then
   repository=library/$repository
 fi
@@ -59,7 +60,6 @@ accept=application/vnd.oci.image.index.v1+json,application/vnd.docker.distributi
 
 work=$(mktemp -d)
 headers=$work/headers
-answer=$work/answer
 
 # HEAD of the tag's manifest, with a token when there is one. Prints the status.
 head_manifest() {
@@ -110,17 +110,17 @@ digest() {
   printf '%s\n' "$value"
 }
 
-# POST to the deploy link. Prints nothing of the link or its answer on success.
+# POST to the deploy link. Logs only the status: an error page may repeat the link.
 deploy() {
   if [ -n "${DEPLOY_HOOK_TOKEN:-}" ]; then
-    status=$(curl --silent --show-error --max-time 60 --request POST --output "$answer" --write-out '%{http_code}' \
+    status=$(curl --silent --show-error --max-time 60 --request POST --output /dev/null --write-out '%{http_code}' \
       --header "Authorization: Bearer $DEPLOY_HOOK_TOKEN" "$DEPLOY_HOOK_URL") || return 1
   else
-    status=$(curl --silent --show-error --max-time 60 --request POST --output "$answer" --write-out '%{http_code}' \
+    status=$(curl --silent --show-error --max-time 60 --request POST --output /dev/null --write-out '%{http_code}' \
       "$DEPLOY_HOOK_URL") || return 1
   fi
   case $status in 2??) return 0 ;; esac
-  log "The deploy link answered HTTP $status: $(head -c 300 "$answer")"
+  log "The deploy link answered HTTP $status."
   return 1
 }
 
