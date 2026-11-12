@@ -1,0 +1,11 @@
+# Sections of the generated release notes, by pull request label.
+changelog:
+  categories:
+    - title: Upgrade steps needed
+      labels: [breaking]
+    - title: Changes
+      labels: ["*"]
+      exclude:
+        labels: [dependencies]
+    - title: Dependency updates
+      labels: [dependencies]
