@@ -74,8 +74,10 @@ services:
 | `REGISTRY_USERNAME`, `REGISTRY_PASSWORD` | Only for a private image: a user and a token that may read it. |
 | `CHECK_INTERVAL` | Seconds between checks. Default 3600. |
 
-The app's services need `pull_policy: always`, so that a redeploy downloads the
-moved tag instead of reusing the old image.
+A redeploy must download the moved tag, or it starts the old image again.
+Coolify downloads the images by itself. On a platform that only starts the
+Compose file, the app's services need `pull_policy: always`; Meldgrove apps
+that run on such platforms have the setting `PULL_POLICY=always` for it.
 
 ### Coolify
 
