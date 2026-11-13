@@ -36,7 +36,8 @@ minor version below 1.0.0 (0.3 → 0.4), the next major version from 1.0.0
 safe to update unattended, and it stays current until such a release. From
 1.0.0 a tag such as `1.2` is safe too, but only receives fixes.
 
-When a release is out that the tag does not reach, the updater logs it. Read
+When a release is out that the tag does not reach, the updater logs it once a
+day. Read
 the release notes of every release since yours, take their upgrade steps, and
 change the tag. With `latest` the updater installs such a release before anyone
 has taken its steps, so read each release's notes as it comes out (Watch >

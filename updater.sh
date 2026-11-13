@@ -144,16 +144,13 @@ releases() {
   done
 }
 
-# Logs, once per release, that a release is out which the watched tag never
-# reaches: 0.4.0 for the tag 0.3, 2.0.0 for the tag 1. Someone has to read its
-# notes and change the tag. Tags that are no version (latest) follow everything.
-noted=""
+# Logs, once a day, that a release is out which the watched tag never reaches:
+# 0.4.0 for the tag 0.3, 2.0.0 for the tag 1. Someone has to read its notes and
+# change the tag. Tags that are no version (latest) follow everything.
 note_newer() {
   case $tag in '' | *[!0-9.]* | .* | *. | *..*) return 0 ;; esac
   newest=$(releases | sort -t . -k 1,1n -k 2,2n -k 3,3n | tail -n 1)
-  if [ -z "$newest" ] || [ "$newest" = "$noted" ]; then
-    return 0
-  fi
+  [ -n "$newest" ] || return 0
   old_ifs=$IFS
   IFS=.
   # shellcheck disable=SC2086 # split the tag and the release at their dots
@@ -168,7 +165,6 @@ note_newer() {
       { [ "$4" -eq "$1" ] && [ "$5" -eq "$2" ] && [ "$6" -gt "$3" ]; } || return 0 ;;
     *) return 0 ;;
   esac
-  noted=$newest
   log "Release $newest is out, and the tag $tag does not reach it. To install it, read the release notes of every release since yours, then change the tag."
 }
 
