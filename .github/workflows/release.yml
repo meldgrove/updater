@@ -45,7 +45,7 @@ jobs:
       id-token: write # sign the attestation
       attestations: write
       artifact-metadata: write
-    uses: meldgrove/.github/.github/workflows/release.yml@2992f779b9d37a09474476cdbbfb2785be1431b3 # v1.0.0
+    uses: meldgrove/.github/.github/workflows/release.yml@ec8cbc167c9eb7259158c832740e61adbc86897a # v1.0.0
     with:
       bump: ${{ inputs.bump || 'patch' }}
       candidate: ${{ inputs.candidate || false }}
