@@ -10,8 +10,9 @@ updater calls the hosting platform's deploy link, and the platform pulls the new
 image and restarts the app.
 
 ```text
-release ─► image tags move (1.2.3 → 1.2, latest)
-updater: hourly, did the app's tag move? ─► yes ─► POST deploy link ─► platform redeploys
+release ─► image tags move (1.2.3 → 1.2, 1, latest)
+updater: hourly, did the app's tag move? ─► yes ─► cooldown over, window open?
+  ─► POST deploy link ─► platform redeploys
 ```
 
 It needs no access to Docker, only to the registry and the deploy link. It works
@@ -24,16 +25,22 @@ The tag the app runs decides which releases install automatically:
 
 | Tag | Installs automatically |
 | --- | --- |
-| `1.2` | patch releases of 1.2 (1.2.4, 1.2.5, …), which need no manual steps |
+| `0.3` | below 1.0.0: every release of the 0.3 series (0.3.1, 0.3.2, …) |
+| `1` | from 1.0.0: every release of version 1 (1.0.1, 1.1.0, …) |
 | `latest` | every release, including those with upgrade steps |
 | `1.2.3` | nothing |
 
-Meldgrove apps put manual upgrade steps only into minor and major releases, at the
-top of their release notes. A minor version tag such as `1.2` is therefore safe
-to update unattended. With `latest`, read each release's notes as it comes out
-(Watch > Custom > Releases on GitHub), since the updater installs it before anyone
-has taken its steps. A major version tag such as `1` gets minor releases too and
-carries the same risk.
+Meldgrove apps start a new series when a release needs manual steps: the next
+minor version below 1.0.0 (0.3 → 0.4), the next major version from 1.0.0
+(1 → 2). Features and fixes come within the series. A series tag is therefore
+safe to update unattended, and it stays current until such a release. From
+1.0.0 a tag such as `1.2` is safe too, but only receives fixes.
+
+When a release is out that the tag does not reach, the updater logs it. Read
+the release notes of every release since yours, take their upgrade steps, and
+change the tag. With `latest` the updater installs such a release before anyone
+has taken its steps, so read each release's notes as it comes out (Watch >
+Custom > Releases on GitHub).
 
 ## Switch it on
 
@@ -50,6 +57,9 @@ services:
       IMAGE: ghcr.io/example/app:${APP_VERSION_TAG}
       DEPLOY_HOOK_URL: ${UPDATE_DEPLOY_HOOK_URL:-}
       DEPLOY_HOOK_TOKEN: ${UPDATE_DEPLOY_HOOK_TOKEN:-}
+      COOLDOWN: ${UPDATE_COOLDOWN:-3d}
+      WINDOW: ${UPDATE_WINDOW:-}
+      TZ: ${TZ:-UTC}
 ```
 
 | Setting | Meaning |
@@ -57,6 +67,9 @@ services:
 | `IMAGE` | The image and tag the app runs, as in its `image:` line. |
 | `DEPLOY_HOOK_URL` | The platform's deploy link. Empty: the updater does nothing. |
 | `DEPLOY_HOOK_TOKEN` | Bearer token for the deploy link, if the platform needs one. |
+| `COOLDOWN` | Install a new image only after it has been out this long: `3d`, `12h`, `30m`, or a number of seconds. Default `0`: at once. |
+| `WINDOW` | Install only between two times of day, such as `02:00-05:00`, in the time zone `TZ`. Default: at any time. |
+| `TZ` | Time zone of `WINDOW`, such as `Europe/Berlin`. Default UTC. |
 | `REGISTRY_USERNAME`, `REGISTRY_PASSWORD` | Only for a private image: a user and a token that may read it. |
 | `CHECK_INTERVAL` | Seconds between checks. Default 3600. |
 
@@ -88,17 +101,21 @@ Docker Compose every hour instead:
 0 * * * * cd /srv/app && docker compose up --detach --quiet-pull
 ```
 
-It pulls the tags and replaces only the containers whose image changed.
+It pulls the tags and replaces only the containers whose image changed. The
+cooldown and the window do not apply to it.
 
 ## Check it
 
 The updater's log says what it does:
 
 ```text
-Updater 0.1.0 watches ghcr.io/meldgrove/logbuch:0.2 every 3600s.
+Updater 0.1.1 watches ghcr.io/meldgrove/logbuch:0.2 every 3600s.
+A new image installs once it has been out for 3d.
 Current image: sha256:…
-ghcr.io/meldgrove/logbuch:0.2 points to a new image: sha256:…. Calling the deploy link.
+ghcr.io/meldgrove/logbuch:0.2 points to a new image: sha256:…. It installs once it has been out for 3d.
+Calling the deploy link.
 The platform accepted the deployment.
+Release 0.3.0 is out, and the tag 0.2 does not reach it. To install it, read the release notes of every release since yours, then change the tag.
 ```
 
 `docker compose run --rm updater check` prints the digest the tag points to now,
@@ -108,10 +125,17 @@ or the reason it cannot read it.
 
 - **Backups:** an unattended update runs database migrations without anyone
   watching. Schedule backups first, as the app's deployment docs describe.
-- **What counts as current:** at start the updater takes the image the tag points
-  to as the running one, since a deploy has just pulled it. If the tag moves while
-  the updater is stopped, that release installs with the next one or a manual
-  deploy.
+- **Cooldown:** the time counts from the moment the updater first sees the new
+  image. A newer image starts it again, so a release that is replaced within
+  the cooldown never installs. Security fixes wait as well: deploy by hand to
+  install a release at once. An installation without cooldown runs each
+  release first and shows whether it is sound.
+- **Window:** many platforms stop the app while they deploy. A window such as
+  `02:00-05:00` keeps that out of working hours; `22:00-02:00` spans midnight.
+- **What counts as installed:** a new container takes the image the tag points
+  to as the installed one, since a deployment has just pulled it. The updater
+  keeps what it knows over a restart of its container or of the server, when
+  nothing was pulled: a release that came out meanwhile still installs.
 - **Failures:** if the platform refuses the call, the updater tries again every
   interval and logs the answer. It does not check that the deployment succeeded;
   the platform's notifications do that.
@@ -120,13 +144,15 @@ or the reason it cannot read it.
 
 ## Releases
 
-Maintainers release through Actions > Release > Run workflow, the same workflow
-as every Meldgrove project: patch, minor or major from the latest `vX.Y.Z` tag,
-an image for amd64 and arm64 as `X.Y.Z`, `X.Y`, from 1.0.0 also `X`, and
-`latest`, and a GitHub Release. Patch for fixes, minor for anything new or
-anything operators must act on, major only for really big changes. Apps refer to
-`ghcr.io/meldgrove/updater:X.Y`, so patch releases reach them with their next
-deploy.
+Maintainers release through Actions > Release > Run workflow, with the
+[release workflow](https://github.com/meldgrove/.github#release-workflow) that
+every Meldgrove project shares: patch, minor or major from the latest `vX.Y.Z`
+tag, an image for amd64 and arm64 as `X.Y.Z`, `X.Y`, from 1.0.0 also `X`, and
+`latest`, and a GitHub Release. Below 1.0.0, patch is for everything that
+operators need not act on, features included, and minor only for a release
+that operators must act on; label such a pull request `breaking`. Apps refer
+to `ghcr.io/meldgrove/updater:0.1`, so patch releases reach them with their
+next deploy.
 
 ## License
 
