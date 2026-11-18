@@ -15,6 +15,7 @@ app=localhost:5555/app:1.0
 hook_port=5556
 hook_url="http://127.0.0.1:$hook_port/deploy?uuid=abc&force=false"
 state=$(mktemp -d)
+trigger=$(mktemp -d)
 echo 200 > "$state/status"
 : > "$state/calls"
 hook=""
@@ -22,7 +23,7 @@ hook=""
 cleanup() {
   docker rm --force updater-test-registry updater-test > /dev/null 2>&1 || true
   [ -z "$hook" ] || kill "$hook" 2> /dev/null || true
-  rm -rf "$state"
+  rm -rf "$state" "$trigger"
 }
 trap cleanup EXIT
 
@@ -74,9 +75,14 @@ eventually 30 curl --silent --fail "http://$registry/v2/" > /dev/null || fail "t
 publish 1
 release 1.0.7
 
+# The digest that the registry reports for the app's tag.
+registry_digest() {
+  curl --silent --head --header "Accept: application/vnd.oci.image.index.v1+json,application/vnd.docker.distribution.manifest.list.v2+json,application/vnd.oci.image.manifest.v1+json,application/vnd.docker.distribution.manifest.v2+json" \
+    "http://$registry/v2/app/manifests/1.0" | tr -d '\r' | sed -n 's/^[Dd]ocker-[Cc]ontent-[Dd]igest: *//p'
+}
+
 # check prints the digest the registry reports, for a local and a public image.
-expected=$(curl --silent --head --header "Accept: application/vnd.oci.image.index.v1+json,application/vnd.docker.distribution.manifest.list.v2+json,application/vnd.oci.image.manifest.v1+json,application/vnd.docker.distribution.manifest.v2+json" \
-  "http://$registry/v2/app/manifests/1.0" | tr -d '\r' | sed -n 's/^[Dd]ocker-[Cc]ontent-[Dd]igest: *//p')
+expected=$(registry_digest)
 got=$(docker run --rm --network host --env IMAGE="$app" "$image" check)
 [ "$got" = "$expected" ] || fail "check printed '$got', the registry reports '$expected'"
 pass "check prints the digest of a local image"
@@ -191,5 +197,29 @@ run --env IMAGE=ghcr.io/meldgrove/reimbursements:0.2 --env "DEPLOY_HOOK_URL=$hoo
 eventually 30 logged "is out, and the tag 0.2 does not reach it" || fail "no newer release was announced for a GHCR image"
 stop_quickly
 pass "announces a release that the watched tag does not reach"
+
+# Without a deploy link, a host that ran the setup marks /trigger as watched.
+# The updater then leaves its request there instead of calling a link.
+docker run --rm "$image" host-setup | head -n 1 | grep -q '^#!/bin/sh' || fail "host-setup printed no script"
+pass "host-setup prints the setup script"
+chmod 0777 "$trigger"
+touch "$trigger/watched"
+run --env IMAGE="$app" --volume "$trigger:/trigger"
+eventually 15 logged "The host deploys: it watches /trigger" || fail "the updater did not see that the host watches"
+eventually 15 logged "Current image" || fail "the updater did not read the current image"
+publish 9
+eventually 15 test -e "$trigger/deploy" || fail "no request for the host after the tag moved"
+[ "$(cat "$trigger/deploy")" = "$(registry_digest)" ] || fail "the request names $(cat "$trigger/deploy"), not the new image"
+logged "The host deploys it now" || fail "the request was not logged"
+rm "$trigger/deploy"
+sleep 3
+[ ! -e "$trigger/deploy" ] || fail "asked the host again for the same image"
+pass "a moved tag leaves one request for the host"
+rm "$trigger/watched"
+publish 10
+eventually 15 logged "No host watches /trigger any more" || fail "a request without a watching host was not refused"
+[ ! -e "$trigger/deploy" ] || fail "left a request although no host watches"
+stop_quickly
+pass "no request once the host stops watching"
 
 echo "All tests passed."

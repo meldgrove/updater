@@ -7,17 +7,18 @@ Automatic updates for self-hosted Meldgrove apps such as
 service in the app's `compose.yaml`. Once an hour it asks the image registry
 whether the image tag the app runs points to a new image. When it does, the
 updater calls the hosting platform's deploy link, and the platform pulls the new
-image and restarts the app.
+image and restarts the app. On a Debian server without a platform, a systemd
+unit on the server does that instead.
 
 ```text
 release ─► image tags move (1.2.3 → 1.2, 1, latest)
 updater: hourly, did the app's tag move? ─► yes ─► cooldown over, window open?
-  ─► POST deploy link ─► platform redeploys
+  ─► Coolify: POST deploy link ─► Coolify redeploys
+  ─► Debian:  request in the volume /trigger ─► systemd unit pulls, docker compose up
 ```
 
-It needs no access to Docker, only to the registry and the deploy link. It works
-with any image on any registry, and with any platform that redeploys on a `POST`
-to a link: Coolify, Dokploy, Render and others.
+It needs no access to Docker, only to the registry and the deploy link or its
+volume. It works with any image on any registry.
 
 ## Choose what to install
 
@@ -45,8 +46,11 @@ Custom > Releases on GitHub).
 
 ## Switch it on
 
-Meldgrove apps already contain the service; it does nothing until the deploy link
-is set. For another app, add it to `compose.yaml`:
+Set up backups first: an unattended update runs database migrations without
+anyone watching. Meldgrove apps already contain the service; it does nothing
+until the deploy link is set ([Coolify](#coolify)) or the server watches its
+volume ([Debian](#debian-and-similar-systems)). For another app, add it to
+`compose.yaml`:
 
 ```yaml
 services:
@@ -61,12 +65,17 @@ services:
       COOLDOWN: ${UPDATE_COOLDOWN:-3d}
       WINDOW: ${UPDATE_WINDOW:-}
       TZ: ${TZ:-UTC}
+    volumes:
+      - updater:/trigger
+
+volumes:
+  updater:
 ```
 
 | Setting | Meaning |
 | --- | --- |
 | `IMAGE` | The image and tag the app runs, as in its `image:` line. |
-| `DEPLOY_HOOK_URL` | The platform's deploy link. Empty: the updater does nothing. |
+| `DEPLOY_HOOK_URL` | The platform's deploy link. Empty: the server deploys if its host setup watches `/trigger`; otherwise the updater does nothing. |
 | `DEPLOY_HOOK_TOKEN` | Bearer token for the deploy link, if the platform needs one. |
 | `COOLDOWN` | Install a new image only after it has been out this long: `3d`, `12h`, `30m`, or a number of seconds. Default `0`: at once. |
 | `WINDOW` | Install only between two times of day, such as `02:00-05:00`, in the time zone `TZ`. Default: at any time. |
@@ -74,12 +83,9 @@ services:
 | `REGISTRY_USERNAME`, `REGISTRY_PASSWORD` | Only for a private image: a user and a token that may read it. |
 | `CHECK_INTERVAL` | Seconds between checks. Default 3600. |
 
-A redeploy must download the moved tag, or it starts the old image again.
-Coolify downloads the images by itself. On a platform that only starts the
-Compose file, the app's services need `pull_policy: always`; Meldgrove apps
-that run on such platforms have the setting `PULL_POLICY=always` for it.
-
 ### Coolify
+
+Coolify pulls the images whenever it deploys.
 
 1. Under Settings > Advanced, turn on API Access if it is off.
 2. Under Keys & Tokens > API Tokens, create a token with only the `deploy`
@@ -89,25 +95,47 @@ that run on such platforms have the setting `PULL_POLICY=always` for it.
 4. In the resource's environment variables, set `UPDATE_DEPLOY_HOOK_URL` to the
    webhook and `UPDATE_DEPLOY_HOOK_TOKEN` to the token. Deploy once by hand.
 
-### Other platforms
+Another platform that redeploys on a `POST` to a link works the same way, if
+its deployments pull the images again. Set `DEPLOY_HOOK_TOKEN` only when it
+expects `Authorization: Bearer <token>`, and use an `https://` link: the updater
+does not follow redirects, and the token travels with every call.
 
-Use the platform's deploy hook or redeploy webhook. Set `DEPLOY_HOOK_TOKEN` only
-when the platform expects `Authorization: Bearer <token>`. Use an `https://` link:
-the updater does not follow redirects, and the token travels with every call.
+### Debian and similar systems
 
-### Docker Compose without a platform
+On a server that runs the app with Docker Compose and systemd, such as Debian
+or Ubuntu, the server installs the releases itself. The updater leaves its
+request in its volume at `/trigger`; a systemd unit that waits for it pulls the
+app's image and runs `docker compose up --detach`, which runs migrations
+first. The updater still has no access to Docker.
 
-Without a deploy link, leave `UPDATE_DEPLOY_HOOK_URL` empty and let cron run
-Docker Compose every hour instead:
+Keep `UPDATE_DEPLOY_HOOK_URL` empty (a deploy link takes precedence) and the
+settings in `.env` next to `compose.yaml`. Then, in the app's folder:
 
-```cron
-0 * * * * cd /srv/app && docker compose up --detach --pull always --quiet-pull
+```sh
+docker compose up --detach --pull always
+docker compose run --rm -T --pull always updater host-setup > updater-setup.sh
+sudo sh updater-setup.sh
 ```
 
-`--pull always` downloads the tags again: without it, Docker Compose keeps an
-image it already has unless the service sets `pull_policy: always`. It then
-replaces only the containers whose image changed. The cooldown and the window
-do not apply to it.
+The first line starts the app with the image its tag points to now, which the
+updater then takes as installed. The second writes the setup script from the
+updater's image; read it before you run it as root. It installs `meldgrove-updater-<project>.path` and
+`.service` in `/etc/systemd/system` and their deploy script in
+`/usr/local/lib/meldgrove-updater`, and starts a new updater container, whose
+log then says "The host deploys". `<project>` is the Docker Compose project,
+by default the folder's name.
+
+- Each installation: `journalctl -u meldgrove-updater-<project>.service`.
+- The deploy script runs Docker Compose in the app's folder, with the Compose
+  files of the last `docker compose up`. It pulls only the app's and the
+  updater's images; others, such as a PostgreSQL next to the app, stay as they
+  are.
+- It installs images, not files: a changed `compose.yaml` reaches the server
+  when you update the folder, for example with `git pull` at the next manual
+  upgrade.
+- A private image: sign in as root (`sudo docker login ghcr.io`); the unit
+  pulls as root.
+- Switch it off: `sudo sh updater-setup.sh remove`.
 
 ## Check it
 
@@ -143,9 +171,12 @@ or the reason it cannot read it.
   nothing was pulled: a release that came out meanwhile still installs.
 - **Failures:** if the platform refuses the call, the updater tries again every
   interval and logs the answer. It does not check that the deployment succeeded;
-  the platform's notifications do that.
+  the platform's notifications do that. On Debian, `systemctl status
+  meldgrove-updater-<project>.service` shows a failed installation, and the
+  next release tries again.
 - **Privileges:** the updater runs as `nobody` without the Docker socket. Its
-  token can only start deployments.
+  token can only start deployments. On Debian, the systemd unit runs as root,
+  and only the deploy script; the updater can ask it to deploy, nothing else.
 
 ## Releases
 
