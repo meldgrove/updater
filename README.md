@@ -101,11 +101,13 @@ Without a deploy link, leave `UPDATE_DEPLOY_HOOK_URL` empty and let cron run
 Docker Compose every hour instead:
 
 ```cron
-0 * * * * cd /srv/app && docker compose up --detach --quiet-pull
+0 * * * * cd /srv/app && docker compose up --detach --pull always --quiet-pull
 ```
 
-It pulls the tags and replaces only the containers whose image changed. The
-cooldown and the window do not apply to it.
+`--pull always` downloads the tags again: without it, Docker Compose keeps an
+image it already has unless the service sets `pull_policy: always`. It then
+replaces only the containers whose image changed. The cooldown and the window
+do not apply to it.
 
 ## Check it
 
