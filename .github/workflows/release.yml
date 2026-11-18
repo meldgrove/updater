@@ -26,6 +26,7 @@ on:
       - Dockerfile
       - .dockerignore
       - updater.sh
+      - host-setup.sh
       - .github/workflows/release.yml
 
 permissions:

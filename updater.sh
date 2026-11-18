@@ -2,10 +2,13 @@
 # Meldgrove Updater: redeploys an app when the image tag it runs points to a
 # new image. It asks the registry for the tag's digest once per interval, and
 # when the digest changes, it calls the hosting platform's deploy link. The
-# platform then pulls the image and restarts the app. See README.md.
+# platform then pulls the image and restarts the app. On a server without a
+# platform, the host deploys instead: "host-setup" prints a script that installs
+# a systemd unit, which watches the volume at /trigger. See README.md.
 #
 #   IMAGE              the image and tag the app runs, e.g. ghcr.io/meldgrove/logbuch:0.2
-#   DEPLOY_HOOK_URL    deploy link that redeploys the app on POST; empty: off
+#   DEPLOY_HOOK_URL    deploy link that redeploys the app on POST; empty: the
+#                      host deploys if it watches /trigger, otherwise off
 #   DEPLOY_HOOK_TOKEN  bearer token for the deploy link, if it needs one
 #   REGISTRY_USERNAME  with REGISTRY_PASSWORD: sign in to a private registry
 #   CHECK_INTERVAL     seconds between checks (default 3600)
@@ -15,7 +18,12 @@
 #                      in the time zone TZ (default: at any time)
 #
 # "updater.sh check" prints the tag's digest once and exits.
+# "updater.sh host-setup" prints the host's setup script (host-setup.sh).
 set -eu
+
+# The host's setup marks the volume as watched, and the updater leaves its
+# request to deploy there.
+trigger=/trigger
 
 # Messages go to stderr: stdout carries only the digest of "check".
 log() { printf '%s %s\n' "$(date -u +%Y-%m-%dT%H:%M:%SZ)" "$*" >&2; }
@@ -27,8 +35,13 @@ pause() {
   wait $!
 }
 
-if [ "${1:-}" != check ] && [ -z "${DEPLOY_HOOK_URL:-}" ]; then
-  log "Automatic updates are off: DEPLOY_HOOK_URL is empty."
+if [ "${1:-}" = host-setup ]; then
+  cat /usr/local/share/updater/host-setup.sh
+  exit
+fi
+
+if [ "${1:-}" != check ] && [ -z "${DEPLOY_HOOK_URL:-}" ] && [ ! -e "$trigger/watched" ]; then
+  log "Automatic updates are off: DEPLOY_HOOK_URL is empty, and no host watches $trigger."
   while :; do pause 86400; done
 fi
 
@@ -169,7 +182,19 @@ note_newer() {
 }
 
 # POST to the deploy link. Logs only the status: an error page may repeat the link.
+# Without a link, leave the request in the volume that the host watches.
 deploy() {
+  if [ -z "${DEPLOY_HOOK_URL:-}" ]; then
+    if [ ! -e "$trigger/watched" ]; then
+      log "No host watches $trigger any more."
+      return 1
+    fi
+    { printf '%s\n' "$latest" > "$trigger/deploy.new" && mv "$trigger/deploy.new" "$trigger/deploy"; } 2> /dev/null || {
+      log "Cannot write to $trigger."
+      return 1
+    }
+    return 0
+  fi
   if [ -n "${DEPLOY_HOOK_TOKEN:-}" ]; then
     status=$(curl --silent --show-error --max-time 60 --request POST --output /dev/null --write-out '%{http_code}' \
       --header "Authorization: Bearer $DEPLOY_HOOK_TOKEN" "$DEPLOY_HOOK_URL") || return 1
@@ -187,11 +212,13 @@ if [ "${1:-}" = check ]; then
   exit
 fi
 
-case $DEPLOY_HOOK_URL in http://* | https://*) ;; *)
-  log "DEPLOY_HOOK_URL must start with http:// or https://."
-  exit 1
-  ;;
-esac
+if [ -n "${DEPLOY_HOOK_URL:-}" ]; then
+  case $DEPLOY_HOOK_URL in http://* | https://*) ;; *)
+    log "DEPLOY_HOOK_URL must start with http:// or https://."
+    exit 1
+    ;;
+  esac
+fi
 
 # seconds <time>: 90, 90s, 30m, 12h or 3d in seconds.
 seconds() {
@@ -262,6 +289,7 @@ saved() { sed -n "s/^$1=//p" "$state" 2> /dev/null | head -n 1; }
 log "Updater ${APP_VERSION:-(no version)} watches $image every ${interval}s."
 [ "$cooldown" = 0 ] || log "A new image installs once it has been out for $COOLDOWN."
 [ -z "$window" ] || log "New images install only between ${window%-*} and ${window#*-} (time zone ${TZ:-UTC})."
+[ -n "${DEPLOY_HOOK_URL:-}" ] || log "The host deploys: it watches $trigger."
 retry=$((interval < 60 ? interval : 60))
 if [ "$(saved image)" = "$image" ] && [ -n "$(saved installed)" ]; then
   installed=$(saved installed)
@@ -321,14 +349,22 @@ while :; do
     [ "$left" -ge "$interval" ] || nap=$left
     continue
   fi
-  log "Calling the deploy link."
+  if [ -n "${DEPLOY_HOOK_URL:-}" ]; then
+    log "Calling the deploy link."
+  else
+    log "Asking the host to deploy."
+  fi
   # Saved as installed before the call: a platform may stop this container
   # while it answers, and the next start must not deploy the same image again.
   before=$installed since=$seen
   installed=$latest pending="" seen=""
   save
   if deploy; then
-    log "The platform accepted the deployment."
+    if [ -n "${DEPLOY_HOOK_URL:-}" ]; then
+      log "The platform accepted the deployment."
+    else
+      log "The host deploys it now."
+    fi
   else
     installed=$before pending=$latest seen=$since
     save

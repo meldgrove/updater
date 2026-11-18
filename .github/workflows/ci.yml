@@ -23,7 +23,16 @@ jobs:
           persist-credentials: false
 
       - name: Lint
-        run: shellcheck updater.sh test/run.sh
+        run: |
+          shellcheck updater.sh host-setup.sh test/run.sh test/host.sh
+          # The deploy script that host-setup.sh writes to the server.
+          deploy=$(sed -n "/^cat > \"\$lib\/deploy.new\" << 'EOF'\$/,/^EOF\$/p" host-setup.sh | sed '1d;$d')
+          test -n "$deploy"
+          printf '%s\n' "$deploy" | shellcheck --shell=sh -
 
       - name: End-to-end test
         run: test/run.sh
+
+      # Installs and removes systemd units on the runner, as on a Debian server.
+      - name: Host setup test
+        run: sudo test/host.sh
