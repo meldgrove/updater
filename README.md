@@ -5,16 +5,16 @@ Automatic updates for self-hosted Meldgrove apps such as
 [Reimbursements](https://github.com/meldgrove/reimbursements) and
 [Library](https://github.com/meldgrove/library). The updater runs as one more
 service in the app's `compose.yaml`. Once an hour it asks the image registry
-for new releases (or, on the Preview channel, previews) and installs them:
-through the hosting platform's deploy link, or on a Debian server without a
-platform through a systemd unit that the server runs. The app shows its state
-to its admins and lets them check, install and choose the channel, through a
-small API of the updater.
+for new releases (or, on the Preview channel, previews) and installs them: on
+a Linux server, such as a VPS with Debian or Ubuntu, through a systemd unit
+that the server runs; on a platform such as Coolify, through its deploy link.
+The app shows its state to its admins and lets them check, install and choose
+the channel, through a small API of the updater.
 
 ```text
 release ─► ghcr.io/meldgrove/app:0.2.1          preview ─► ghcr.io/meldgrove/app:0.2.2-preview.3
 updater: hourly, which versions are newer? ─► cooldown over, window open?
-  ─► Debian:  request in the volume /trigger ─► systemd unit: 0.2.1 into .env, pull,
+  ─► Server:  request in the volume /trigger ─► systemd unit: 0.2.1 into .env, pull,
               docker compose up --wait, back to the version before if it is not healthy
   ─► Coolify: POST deploy link ─► Coolify redeploys the image tag
 app (admins): update button, Updates settings ─► updater API on the Compose network
@@ -70,8 +70,6 @@ services:
     environment:
       IMAGE: *image
       VERSION_VARIABLE: APP_VERSION_TAG
-      DEPLOY_HOOK_URL: ${UPDATE_DEPLOY_HOOK_URL:-}
-      DEPLOY_HOOK_TOKEN: ${UPDATE_DEPLOY_HOOK_TOKEN:-}
       # The app sends the same token (its own setting, e.g. UPDATER_TOKEN).
       API_TOKEN: ${UPDATER_TOKEN:-}
       COOLDOWN: ${UPDATE_COOLDOWN:-3d}
@@ -83,6 +81,9 @@ services:
 volumes:
   updater:
 ```
+
+On a platform with a deploy link, such as Coolify, also set `DEPLOY_HOOK_URL`
+and `DEPLOY_HOOK_TOKEN` ([Coolify](#coolify)).
 
 | Setting | Meaning |
 | --- | --- |
@@ -149,9 +150,13 @@ it: update the app's folder to a release with updater 0.2 (`git pull`), run
 
 ### Coolify
 
-Coolify pulls the images whenever it deploys. The image tag set there decides
-which updates install: a series such as `0.3` (Stable without upgrade steps),
-`latest` (every release), or `preview` (every preview).
+Meldgrove apps are made for a server; on Coolify they run from their
+`compose.coolify.yaml`, which adds `DEPLOY_HOOK_URL` and `DEPLOY_HOOK_TOKEN`
+(from `UPDATE_DEPLOY_HOOK_URL` and `UPDATE_DEPLOY_HOOK_TOKEN`) to the
+`updater` service. Coolify pulls the images whenever it deploys. The image
+tag set there decides which updates install: a series such as `0.3` (Stable
+without upgrade steps), `latest` (every release), or `preview` (every
+preview).
 
 1. Under Settings > Advanced, turn on API Access if it is off.
 2. Under Keys & Tokens > API Tokens, create a token with only the `deploy`
