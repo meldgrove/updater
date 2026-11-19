@@ -20,6 +20,7 @@ const manifestTypes = "application/vnd.oci.image.index.v1+json,application/vnd.d
 // OCI distribution registry (GHCR, Docker Hub, a local registry).
 type Registry struct {
 	base       string // https://ghcr.io/v2/meldgrove/handbook
+	scheme     string
 	host       string
 	repository string
 	username   string
@@ -33,6 +34,7 @@ type Registry struct {
 func NewRegistry(c Config) *Registry {
 	return &Registry{
 		base:       fmt.Sprintf("%s://%s/v2/%s", c.Scheme, c.Registry, c.Repository),
+		scheme:     c.Scheme,
 		host:       c.Registry,
 		repository: c.Repository,
 		username:   c.RegistryUsername,
@@ -231,7 +233,7 @@ func (r *Registry) Tags(ctx context.Context) ([]string, error) {
 		tags = append(tags, list.Tags...)
 		next = nextPage(response.Header.Get("Link"), response.Request.URL)
 		// The registry's credentials go only to the registry.
-		if parsed, err := url.Parse(next); next != "" && (err != nil || parsed.Host != r.host || parsed.Scheme != response.Request.URL.Scheme) {
+		if parsed, err := url.Parse(next); next != "" && (err != nil || parsed.Host != r.host || parsed.Scheme != r.scheme) {
 			next = ""
 		}
 	}

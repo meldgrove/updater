@@ -209,6 +209,7 @@ func (e *Engine) Run(ctx context.Context) {
 	defer poll.Stop()
 	timer := time.NewTimer(0)
 	defer timer.Stop()
+	next := e.now()
 	for {
 		select {
 		case <-ctx.Done():
@@ -216,13 +217,18 @@ func (e *Engine) Run(ctx context.Context) {
 		case <-timer.C:
 			e.check(ctx)
 			e.autoInstall(ctx)
-			timer.Reset(e.nextCheck())
+			wait := e.nextCheck()
+			next = e.now().Add(wait)
+			timer.Reset(wait)
 		case <-poll.C:
 			e.pollHost()
 		case request := <-e.requests:
 			request(ctx)
-			// A check or a new channel may bring an update due sooner.
-			timer.Reset(e.nextCheck())
+			// A check may bring an update due sooner; never later than planned.
+			if wait := e.nextCheck(); e.now().Add(wait).Before(next) {
+				next = e.now().Add(wait)
+				timer.Reset(wait)
+			}
 		}
 	}
 }

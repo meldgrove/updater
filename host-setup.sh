@@ -116,8 +116,14 @@ project=${1:?Usage: deploy <project> [updater]}
 mode=${2:-app}
 state=/var/lib/meldgrove-updater/$project
 # The updater container: the newest one, also while stopped.
-container=$(docker ps --all --quiet --filter "label=com.docker.compose.project=$project" \
-  --filter label=com.docker.compose.service=updater | head -n 1)
+# Waits up to about a minute: Compose may be recreating it.
+container=""
+for wait in 2 4 8 16 30; do
+  container=$(docker ps --all --quiet --filter "label=com.docker.compose.project=$project" \
+    --filter label=com.docker.compose.service=updater | head -n 1)
+  [ -z "$container" ] || break
+  sleep "$wait"
+done
 if [ -z "$container" ]; then
   echo "The Docker Compose project $project has no updater container." >&2
   exit 1
@@ -303,7 +309,14 @@ if ! replace_env "$state/env.next"; then
 fi
 # Compose must now run the version: another env file, the shell or a value
 # that spans lines could still decide otherwise.
-images=$(compose "$@" config --images 2> "$log" | grep -F "$repository:" || true)
+# The images of the app: references whose repository (without tag or
+# digest) is the app's.
+images=$(compose "$@" config --images 2> "$log" | awk -v repository="$repository" '{
+    name = $0
+    sub(/@.*/, "", name)
+    if (match(name, /:[^\/]*$/)) name = substr(name, 1, RSTART - 1)
+    if (name == repository) print
+  }')
 if [ -z "$images" ] || printf '%s\n' "$images" | grep -Fvxq "$target"; then
   replace_env "$state/env.before" || echo "Could not restore $env_file from $state/env.before." >&2
   finish failed "After writing $variable=$version to $env_file, Docker Compose still does not run $target. Check where $variable is set."
