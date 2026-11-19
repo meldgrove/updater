@@ -103,11 +103,25 @@ api() { docker exec updater-test updater "$@"; }
 eventually 20 sh -c 'docker inspect --format "{{.State.Health.Status}}" updater-test | grep -qx healthy' || fail "the container is not healthy"
 [ "$(api status | jq -r .mode)" = off ] || fail "the status does not say off: $(api status)"
 api install 9.9.9 2> /dev/null && fail "installed while off"
+logged "The API takes requests without a token" || fail "no warning about the API without a token"
 stop_quickly
 pass "off without a deploy link, answers the API, and stops at once"
 
+# With API_TOKEN, the API answers only requests with the token; the commands
+# in the container send it, and the health check needs none.
+run --env IMAGE="$app" --env API_TOKEN=test-token-0123456789
+eventually 20 sh -c 'docker inspect --format "{{.State.Health.Status}}" updater-test | grep -qx healthy' || fail "the container is not healthy with a token"
+answer() { curl --silent --output /dev/null --write-out '%{http_code}' "$@" http://127.0.0.1:8080/v1/status; }
+[ "$(answer)" = 401 ] || fail "the API answered without the token"
+[ "$(answer --header 'Authorization: Bearer wrong')" = 401 ] || fail "the API answered a wrong token"
+[ "$(answer --header 'Authorization: Bearer test-token-0123456789')" = 200 ] || fail "the API refused the token"
+[ "$(api status | jq -r .mode)" = off ] || fail "the status command did not send the token"
+! logged "The API takes requests without a token" || fail "warned although the API has a token"
+stop_quickly
+pass "with API_TOKEN, the API refuses requests without the token"
+
 # Misconfiguration ends the updater with a message.
-for setting in "IMAGE=$app@sha256:0000" CHECK_INTERVAL=hourly COOLDOWN=soon WINDOW=2-5 WINDOW=02:00-02:00 WINDOW=25:00-03:00 "VERSION_VARIABLE=APP VERSION"; do
+for setting in "IMAGE=$app@sha256:0000" CHECK_INTERVAL=hourly COOLDOWN=soon WINDOW=2-5 WINDOW=02:00-02:00 WINDOW=25:00-03:00 "VERSION_VARIABLE=APP VERSION" "API_TOKEN=two words"; do
   if docker run --rm --env IMAGE="$app" --env "$setting" --env DEPLOY_HOOK_URL=http://127.0.0.1:1/ "$image" > /dev/null 2>&1; then
     fail "the updater accepted $setting"
   fi
@@ -115,7 +129,7 @@ done
 if docker run --rm --env IMAGE="$app" --env DEPLOY_HOOK_URL=ftp://example.invalid/ "$image" > /dev/null 2>&1; then
   fail "the updater accepted an ftp deploy link"
 fi
-pass "rejects a digest, a bad interval, cooldown or window, and a non-HTTP deploy link"
+pass "rejects a digest, a bad interval, cooldown or window, a token with spaces, and a non-HTTP deploy link"
 
 # An unchanged tag deploys nothing; a moved tag deploys once, with the token.
 run --env IMAGE="$app" --env "DEPLOY_HOOK_URL=$hook_url" --env DEPLOY_HOOK_TOKEN=secret

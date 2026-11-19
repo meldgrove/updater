@@ -175,6 +175,8 @@ func TestImageParsing(t *testing.T) {
 		{"IMAGE": "app:1", "DEPLOY_HOOK_URL": "ftp://example.org/"},
 		{"IMAGE": "app:1", "VERSION_VARIABLE": "APP VERSION"},
 		{"IMAGE": "app:1", "TZ": "Mars/Base"},
+		{"IMAGE": "app:1", "API_TOKEN": "two words"},
+		{"IMAGE": "app:1", "API_TOKEN": "line\nbreak"},
 		{},
 	} {
 		if _, err := LoadConfig(func(name string) string { return bad[name] }); err == nil {

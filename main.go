@@ -134,6 +134,9 @@ func serve(cfg Config, engine *Engine) int {
 
 	var server *http.Server
 	if cfg.Listen != "off" {
+		if cfg.APIToken == "" {
+			logf("The API takes requests without a token: anything that reaches %s on the network can install updates. Set API_TOKEN, and give the app the same token.", cfg.Listen)
+		}
 		listener, err := net.Listen("tcp", cfg.Listen)
 		if err != nil {
 			logf("The API cannot listen on %s: %v", cfg.Listen, err)
@@ -194,6 +197,9 @@ func client(method, path string, body any, field ...string) int {
 	}
 	request, _ := http.NewRequest(method, local()+path, reader)
 	request.Header.Set("Content-Type", "application/json")
+	if token := os.Getenv("API_TOKEN"); token != "" {
+		request.Header.Set("Authorization", "Bearer "+token)
+	}
 	response, err := (&http.Client{Timeout: 90 * time.Second}).Do(request)
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "updater: the updater does not answer at %s: %v\n", local(), err)

@@ -72,6 +72,8 @@ services:
       VERSION_VARIABLE: APP_VERSION_TAG
       DEPLOY_HOOK_URL: ${UPDATE_DEPLOY_HOOK_URL:-}
       DEPLOY_HOOK_TOKEN: ${UPDATE_DEPLOY_HOOK_TOKEN:-}
+      # The app sends the same token (its own setting, e.g. UPDATER_TOKEN).
+      API_TOKEN: ${UPDATER_TOKEN:-}
       COOLDOWN: ${UPDATE_COOLDOWN:-3d}
       WINDOW: ${UPDATE_WINDOW:-}
       TZ: ${TZ:-UTC}
@@ -95,6 +97,7 @@ volumes:
 | `GITHUB_TOKEN` | Only for release notes of a private repository. |
 | `CHECK_INTERVAL` | Seconds between checks. Default 3600. |
 | `LISTEN` | Address of the API, default `:8080`; `off` switches it off. |
+| `API_TOKEN` | The token the app sends with every API request ([The app's update button](#the-apps-update-button)), such as the output of `openssl rand -base64 32`. Empty: the API takes requests from anything that reaches it. |
 
 ### Debian and similar systems
 
@@ -166,9 +169,14 @@ updater does not follow redirects, and the token travels with every call.
 
 ## The app's update button
 
-Apps reach the updater at `http://updater:8080` on the Compose network. The
-API has no authentication: never publish its port. Only the app's admins see
-the update button, and the app checks that before it calls the API.
+Apps reach the updater at `http://updater:8080` on the Compose network. With
+`API_TOKEN` set, every request but `GET /healthz` needs it as
+`Authorization: Bearer <token>`; others get `401`. Give the app the same
+token. Without `API_TOKEN`, the API takes requests from anything that
+reaches it, and the updater says so in its log. Never publish its port. Only
+the app's admins see the update button, and the app checks that before it
+calls the API. The commands `updater status`, `install` and `channel` in the
+container send the token themselves.
 
 | Request | Answer |
 | --- | --- |
