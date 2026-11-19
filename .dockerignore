@@ -1,3 +1,4 @@
 *
-!updater.sh
+!go.mod
+!*.go
 !host-setup.sh

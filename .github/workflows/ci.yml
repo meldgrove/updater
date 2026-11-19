@@ -16,15 +16,30 @@ jobs:
   test:
     name: Lint and end-to-end test
     runs-on: ubuntu-24.04
-    timeout-minutes: 10
+    timeout-minutes: 20
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
 
-      - name: Lint
+      - uses: actions/setup-go@d8cbb8045d7f43706b9177cceb36c1f91a6644d5 # v7.1.0
+        with:
+          go-version-file: go.mod
+          cache: false # no dependencies
+
+      - name: Go format, vet and unit tests
         run: |
-          shellcheck updater.sh host-setup.sh test/run.sh test/host.sh
+          unformatted=$(gofmt -l .)
+          if [ -n "$unformatted" ]; then
+            echo "::error::Not formatted with gofmt: $unformatted"
+            exit 1
+          fi
+          go vet ./...
+          go test -race -count=1 ./...
+
+      - name: Lint the shell scripts
+        run: |
+          shellcheck host-setup.sh test/run.sh test/host.sh
           # The deploy script that host-setup.sh writes to the server.
           deploy=$(sed -n "/^cat > \"\$lib\/deploy.new\" << 'EOF'\$/,/^EOF\$/p" host-setup.sh | sed '1d;$d')
           test -n "$deploy"
@@ -33,6 +48,7 @@ jobs:
       - name: End-to-end test
         run: test/run.sh
 
-      # Installs and removes systemd units on the runner, as on a Debian server.
+      # Installs and removes systemd units on the runner, as on a Debian
+      # server: installs, rollbacks, channels.
       - name: Host setup test
         run: sudo test/host.sh

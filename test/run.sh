@@ -45,7 +45,7 @@ eventually() {
 }
 calls_are() { [ "$(calls)" = "$1" ]; }
 calls_at_least() { [ "$(calls)" -ge "$1" ]; }
-logged() { docker logs updater-test 2>&1 | grep -q "$1"; }
+logged() { docker logs updater-test 2>&1 | grep "$1" > /dev/null; }
 # publish <n>: push a new image under the app's tag.
 publish() {
   printf 'FROM %s\nLABEL test.revision=%s\n' "$image" "$1" | docker build --quiet --tag "$app" - > /dev/null
@@ -95,14 +95,19 @@ for name in alpine:3 docker.io/library/alpine:3; do
 done
 pass "check reads Docker Hub, with and without docker.io"
 
-# Without a deploy link the updater only says it is off.
+# Without a deploy link the updater says it is off, and still answers the
+# app: the API is up and the container is healthy.
 run --env IMAGE="$app"
 eventually 10 logged "Automatic updates are off" || fail "no 'off' message"
+api() { docker exec updater-test updater "$@"; }
+eventually 20 sh -c 'docker inspect --format "{{.State.Health.Status}}" updater-test | grep -qx healthy' || fail "the container is not healthy"
+[ "$(api status | jq -r .mode)" = off ] || fail "the status does not say off: $(api status)"
+api install 9.9.9 2> /dev/null && fail "installed while off"
 stop_quickly
-pass "off without a deploy link, and stops at once"
+pass "off without a deploy link, answers the API, and stops at once"
 
 # Misconfiguration ends the updater with a message.
-for setting in "IMAGE=$app@sha256:0000" CHECK_INTERVAL=hourly COOLDOWN=soon WINDOW=2-5 WINDOW=02:00-02:00 WINDOW=25:00-03:00; do
+for setting in "IMAGE=$app@sha256:0000" CHECK_INTERVAL=hourly COOLDOWN=soon WINDOW=2-5 WINDOW=02:00-02:00 WINDOW=25:00-03:00 "VERSION_VARIABLE=APP VERSION"; do
   if docker run --rm --env IMAGE="$app" --env "$setting" --env DEPLOY_HOOK_URL=http://127.0.0.1:1/ "$image" > /dev/null 2>&1; then
     fail "the updater accepted $setting"
   fi
@@ -210,16 +215,52 @@ eventually 15 logged "Current image" || fail "the updater did not read the curre
 publish 9
 eventually 15 test -e "$trigger/deploy" || fail "no request for the host after the tag moved"
 [ "$(cat "$trigger/deploy")" = "$(registry_digest)" ] || fail "the request names $(cat "$trigger/deploy"), not the new image"
-logged "The host deploys it now" || fail "the request was not logged"
+logged "Asking the host to deploy" || fail "the request was not logged"
 rm "$trigger/deploy"
+eventually 10 logged "The host deploys it now" || fail "the pickup was not logged"
 sleep 3
 [ ! -e "$trigger/deploy" ] || fail "asked the host again for the same image"
 pass "a moved tag leaves one request for the host"
 rm "$trigger/watched"
 publish 10
-eventually 15 logged "No host watches /trigger any more" || fail "a request without a watching host was not refused"
+eventually 15 logged "no host watches /trigger any more" || fail "a request without a watching host was not refused"
 [ ! -e "$trigger/deploy" ] || fail "left a request although no host watches"
 stop_quickly
 pass "no request once the host stops watching"
+
+# A host setup of protocol 2: the updater picks versions by channel and asks
+# the host to install the exact version; the host reports the result.
+rm -rf "${trigger:?}"/*
+printf 'protocol=2\nproject=app\n' > "$trigger/watched"
+publish 11
+release 2.0.0
+run --env IMAGE="${app%:*}:2.0.0" --env VERSION_VARIABLE=APP_TAG --volume "$trigger:/trigger"
+eventually 15 logged "Versions are chosen by the channel" || fail "the updater does not pin versions"
+eventually 15 sh -c "docker exec updater-test updater status | jq -e '.installed == \"2.0.0\" and .available == null' > /dev/null" ||
+  fail "unexpected status: $(api status)"
+release 2.0.1
+release 2.1.0-preview.1
+eventually 15 grep -sqx version=2.0.1 "$trigger/deploy" || fail "no request for 2.0.1: $(cat "$trigger/deploy" 2> /dev/null)"
+grep -qx protocol=2 "$trigger/deploy" || fail "the request has no protocol"
+id=$(sed -n 's/^id=//p' "$trigger/deploy")
+[ "$(api status | jq -r .installing.version)" = 2.0.1 ] || fail "the status shows no installation"
+rm "$trigger/deploy"
+printf 'id=%s\nstage=starting\n' "$id" > "$trigger/progress"
+eventually 10 sh -c "docker exec updater-test updater status | jq -e '.installing.stage == \"starting\"' > /dev/null" || fail "the stage was not read"
+printf 'id=%s\nversion=2.0.1\nresult=rolled-back\nmessage=container app-web-1 is unhealthy\nfinished=%s\n' "$id" "$(date +%s)" > "$trigger/result"
+eventually 10 sh -c "docker exec updater-test updater status | jq -e '.last.result == \"rolled-back\" and .available.failed != null' > /dev/null" ||
+  fail "the result was not read: $(api status)"
+sleep 3
+[ ! -e "$trigger/deploy" ] || fail "tried the failed version again"
+pass "asks the host for an exact version, reads its stages and result, and does not retry a failure"
+[ "$(api channel)" = stable ] || fail "the channel is not stable"
+api channel preview > /dev/null
+eventually 15 grep -sqx version=2.1.0-preview.1 "$trigger/deploy" || fail "no request for the preview"
+pass "the Preview channel installs previews"
+docker restart updater-test > /dev/null
+eventually 15 sh -c "docker exec updater-test updater status | jq -e '.channel == \"preview\" and .installing.version == \"2.1.0-preview.1\"' > /dev/null" ||
+  fail "the restarted updater forgot its state: $(api status)"
+stop_quickly
+pass "keeps channel and installation over a restart"
 
 echo "All tests passed."

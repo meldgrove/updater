@@ -25,7 +25,8 @@ on:
     paths:
       - Dockerfile
       - .dockerignore
-      - updater.sh
+      - go.mod
+      - "*.go"
       - host-setup.sh
       - .github/workflows/release.yml
 
@@ -54,5 +55,5 @@ jobs:
       image: ghcr.io/meldgrove/updater
       upgrade_doc: README.md
       title: Meldgrove Updater
-      description: Redeploys a self-hosted app through its platform's deploy link when the image tag it runs points to a new image.
+      description: "Installs new releases or previews of a self-hosted app: through a platform's deploy link or the server's host setup, with rollback, and with an API for the app's update button."
       license: Apache-2.0
