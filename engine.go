@@ -380,14 +380,19 @@ func (e *Engine) checkPinned(ctx context.Context) error {
 	e.versionsSeen = all
 	channel := e.state.Channel
 	now := e.now()
-	for key := range e.state.Seen {
-		if v, ok := ParseVersion(key); !ok || v.Compare(*installed) <= 0 {
-			delete(e.state.Seen, key)
+	// Forget versions at or below the installed one, but not while an
+	// installation runs: the container of the version being tried may
+	// still go back to the one before, and older failures must stay.
+	if e.state.Install == nil {
+		for key := range e.state.Seen {
+			if v, ok := ParseVersion(key); !ok || v.Compare(*installed) <= 0 {
+				delete(e.state.Seen, key)
+			}
 		}
-	}
-	for key := range e.state.Failed {
-		if v, ok := ParseVersion(key); !ok || v.Compare(*installed) <= 0 {
-			delete(e.state.Failed, key)
+		for key := range e.state.Failed {
+			if v, ok := ParseVersion(key); !ok || v.Compare(*installed) <= 0 {
+				delete(e.state.Failed, key)
+			}
 		}
 	}
 	var inSeries, newer []Version

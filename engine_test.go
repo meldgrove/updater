@@ -627,3 +627,46 @@ func TestHostCommands(t *testing.T) {
 		t.Fatal("host-unwatch left files")
 	}
 }
+
+// A failed version stays failed while the container of a newer attempt runs
+// and that attempt rolls back.
+func TestFailuresSurviveARolledBackAttempt(t *testing.T) {
+	h := newHarness(t, nil, time.Time{})
+	h.registry.set("0.2.0", "0.2.1")
+	h.watch(2)
+	h.engine.start()
+	h.cycle()
+	first := h.request()["id"]
+	os.Remove(filepath.Join(h.trigger, "deploy"))
+	h.report("result", "id="+first, "version=0.2.1", "result=rolled-back", "message=unhealthy", "finished=1795000000")
+	h.engine.pollHost()
+	h.registry.set("0.2.2")
+	h.cycle()
+	second := h.request()["id"]
+	if h.request()["version"] != "0.2.2" {
+		t.Fatalf("request = %v", h.request())
+	}
+	os.Remove(filepath.Join(h.trigger, "deploy"))
+	// The deployment recreates the updater with the version it tries.
+	restart := func(tag, host string) {
+		h.engine.cfg.Tag = tag
+		h.engine.cfg.Image = h.engine.cfg.ImageName() + ":" + tag
+		h.engine.hostname = host
+		h.engine.installed = nil
+		h.engine.start()
+		h.cycle()
+	}
+	restart("0.2.2", "container-2")
+	// It does not start: back to 0.2.0, reported.
+	restart("0.2.0", "container-3")
+	h.report("result", "id="+second, "version=0.2.2", "result=rolled-back", "message=migrate failed", "finished=1795000100")
+	h.engine.pollHost()
+	h.cycle()
+	if request := h.request(); request != nil {
+		t.Fatalf("retried a failed version: %v", request)
+	}
+	s := h.status()
+	if s.Available == nil || s.Available.Version != "0.2.2" || s.Available.Failed == nil {
+		t.Fatalf("available = %+v", s.Available)
+	}
+}
