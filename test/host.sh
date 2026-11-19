@@ -224,6 +224,14 @@ fi
 [ "$(stat -c %a .env)" = 640 ] || fail ".env changed its mode to $(stat -c %a .env)"
 pass "a release installs: pinned in .env, migrated, started, healthy, reported"
 
+# The volume belongs to the unprivileged updater: links it places there must
+# never make the root deploy script write elsewhere.
+canary=$(mktemp)
+echo untouched > "$canary"
+chmod 0600 "$canary"
+pinned_compose exec -T updater sh -c "ln -sf '$canary' /trigger/progress.new && ln -sf '$canary' /trigger/result.new" ||
+  fail "could not place the links"
+
 version 1.0.2 unhealthy
 eventually 120 status_has '.last.version == "1.0.2" and .last.result == "rolled-back"' || fail "1.0.2 was not rolled back: $(status)"
 env_tag_is 1.0.1 || fail ".env has APP_TAG=$(env_tag) after the rollback"
@@ -232,6 +240,9 @@ status_has '.last.message | test("unhealthy")' || fail "the rollback does not sa
 sleep 5
 status_has '.installing == null and .available.failed != null' || fail "the failed version is tried again: $(status)"
 pass "an unhealthy release goes back to the version before and is not tried again"
+[ "$(cat "$canary")" = untouched ] && [ "$(stat -c %a "$canary")" = 600 ] || fail "the deploy script followed a link in the volume"
+rm -f "$canary"
+pass "links in the volume do not redirect the root deploy script"
 
 version 1.0.3 healthy 3
 eventually 120 status_has '.last.version == "1.0.3" and .last.result == "rolled-back"' || fail "1.0.3 was not rolled back: $(status)"

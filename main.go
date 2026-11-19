@@ -17,6 +17,9 @@ import (
 	"net/http"
 	"os"
 	"os/signal"
+	"path/filepath"
+	"regexp"
+	"strings"
 	"syscall"
 	"time"
 	_ "time/tzdata" // WINDOW is read in the time zone TZ
@@ -38,7 +41,11 @@ const usage = `Usage: updater [command]
                     print the channel, or switch to it
   host-setup        print the setup script for a server without a platform
   healthcheck       exit 0 while the API answers
-  version           print the updater's version`
+  version           print the updater's version
+The host setup's deploy script runs these in the container, so that it never
+writes into the volume itself:
+  host-watch PROJECT, host-unwatch, host-request,
+  host-report progress ID STAGE, host-report result ID VERSION RESULT [MESSAGE]`
 
 func main() {
 	os.Exit(run(os.Args[1:]))
@@ -61,6 +68,8 @@ func run(args []string) int {
 		return 0
 	case "healthcheck":
 		return healthcheck()
+	case "host-watch", "host-unwatch", "host-request", "host-report":
+		return hostCommand(orDefault(os.Getenv("TRIGGER_DIR"), "/trigger"), args)
 	case "status":
 		return client(http.MethodGet, "/v1/status", nil)
 	case "install":
@@ -209,3 +218,68 @@ func client(method, path string, body any, field ...string) int {
 	fmt.Println(string(pretty))
 	return 0
 }
+
+// hostCommand serves the deploy script of the host setup, which runs it with
+// docker exec as the container's unprivileged user. The script never reads
+// or writes the volume as root, so links placed there cannot redirect it.
+func hostCommand(trigger string, args []string) int {
+	path := func(name string) string { return filepath.Join(trigger, name) }
+	write := func(name string, lines ...string) int {
+		if err := writeAtomic(path(name), []byte(strings.Join(lines, "\n")+"\n"), 0o644); err != nil {
+			fmt.Fprintf(os.Stderr, "updater: %v\n", err)
+			return 1
+		}
+		return 0
+	}
+	single := func(text string) string {
+		return strings.Map(func(r rune) rune {
+			if r < 32 || r == 127 {
+				return ' '
+			}
+			return r
+		}, text)
+	}
+	switch {
+	case args[0] == "host-watch" && len(args) == 2 && projectPattern.MatchString(args[1]):
+		_ = os.Remove(path("deploy"))
+		return write("watched", "protocol=2", "project="+args[1])
+	case args[0] == "host-unwatch" && len(args) == 1:
+		for _, name := range []string{"watched", "deploy", "progress", "result"} {
+			_ = os.Remove(path(name))
+		}
+		return 0
+	case args[0] == "host-request" && len(args) == 1:
+		// Prints and takes the request; a request that is no plain file is
+		// dropped unread.
+		info, err := os.Lstat(path("deploy"))
+		if err != nil {
+			return 0
+		}
+		defer os.Remove(path("deploy"))
+		if !info.Mode().IsRegular() || info.Size() > 4096 {
+			return 0
+		}
+		data, err := os.ReadFile(path("deploy"))
+		if err != nil {
+			return 1
+		}
+		fmt.Print(string(data))
+		return 0
+	case args[0] == "host-report" && len(args) == 4 && args[1] == "progress":
+		return write("progress", "id="+single(args[2]), "stage="+single(args[3]))
+	case args[0] == "host-report" && (len(args) == 5 || len(args) == 6) && args[1] == "result":
+		message := ""
+		if len(args) == 6 {
+			message = single(args[5])
+		}
+		if len(message) > 400 {
+			message = message[:400]
+		}
+		return write("result", "id="+single(args[2]), "version="+single(args[3]), "result="+single(args[4]),
+			"message="+message, fmt.Sprintf("finished=%d", time.Now().Unix()))
+	}
+	fmt.Fprintln(os.Stderr, usage)
+	return 2
+}
+
+var projectPattern = regexp.MustCompile(`^[a-z0-9][a-z0-9_-]*$`)

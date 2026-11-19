@@ -589,3 +589,41 @@ func (e *Engine) serveRequests(t *testing.T) {
 		request(context.Background())
 	}
 }
+
+func TestHostCommands(t *testing.T) {
+	trigger := t.TempDir()
+	if code := hostCommand(trigger, []string{"host-watch", "app"}); code != 0 {
+		t.Fatal("host-watch failed")
+	}
+	if fields, _ := readFields(filepath.Join(trigger, "watched")); fields["protocol"] != "2" || fields["project"] != "app" {
+		t.Fatalf("watched = %v", fields)
+	}
+	if code := hostCommand(trigger, []string{"host-watch", "../etc"}); code == 0 {
+		t.Fatal("accepted an odd project name")
+	}
+	// A request that is a link is dropped unread.
+	secret := filepath.Join(t.TempDir(), "secret")
+	os.WriteFile(secret, []byte("version=9.9.9\n"), 0o600)
+	os.Symlink(secret, filepath.Join(trigger, "deploy"))
+	if code := hostCommand(trigger, []string{"host-request"}); code != 0 || exists(filepath.Join(trigger, "deploy")) {
+		t.Fatal("the linked request was not dropped")
+	}
+	// A result replaces a link instead of writing through it.
+	os.Symlink(secret, filepath.Join(trigger, "result"))
+	if code := hostCommand(trigger, []string{"host-report", "result", "abc", "1.0.1", "rolled-back", "container\nweb is unhealthy"}); code != 0 {
+		t.Fatal("host-report failed")
+	}
+	fields, _ := readFields(filepath.Join(trigger, "result"))
+	if fields["result"] != "rolled-back" || fields["message"] != "container web is unhealthy" || fields["id"] != "abc" {
+		t.Fatalf("result = %v", fields)
+	}
+	if data, _ := os.ReadFile(secret); string(data) != "version=9.9.9\n" {
+		t.Fatal("wrote through the link")
+	}
+	if code := hostCommand(trigger, []string{"host-report", "result", "abc", "1.0.1", "installed"}); code != 0 {
+		t.Fatal("host-report without a message failed")
+	}
+	if code := hostCommand(trigger, []string{"host-unwatch"}); code != 0 || exists(filepath.Join(trigger, "watched")) || exists(filepath.Join(trigger, "result")) {
+		t.Fatal("host-unwatch left files")
+	}
+}

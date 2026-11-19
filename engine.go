@@ -28,18 +28,19 @@ type Engine struct {
 
 	requests chan func(context.Context)
 
-	mu        sync.Mutex
-	state     State
-	installed *Version // pinned: the version that runs
-	available *offer
-	attention *offer
-	checking  bool
-	checkedAt time.Time
-	checkErr  string
-	tagDigest string // following a tag: the digest it points to now
-	infos     map[string]ImageInfo
-	logged    map[string]time.Time
-	lastMode  string
+	mu           sync.Mutex
+	state        State
+	installed    *Version // pinned: the version that runs
+	available    *offer
+	attention    *offer
+	checking     bool
+	checkedAt    time.Time
+	checkErr     string
+	versionsSeen []Version // the registry's versions at the last check, newest first
+	wakeAt       time.Time // a ready update waits for the window to open
+	infos        map[string]ImageInfo
+	logged       map[string]time.Time
+	lastMode     string
 }
 
 // offer is an update the app can show.
@@ -236,31 +237,34 @@ func (e *Engine) nextCheck() time.Duration {
 			wait = until + time.Second
 		}
 	}
+	if !e.wakeAt.IsZero() {
+		if until := e.wakeAt.Sub(e.now()); until < wait {
+			wait = until + time.Second
+		}
+	}
 	if wait < time.Second {
 		wait = time.Second
 	}
 	return wait
 }
 
-// do runs a request in the Run goroutine and waits for it, at most timeout.
-func (e *Engine) do(ctx context.Context, timeout time.Duration, request func(context.Context)) bool {
-	done := make(chan struct{})
-	wrapped := func(ctx context.Context) {
-		defer close(done)
-		request(ctx)
-	}
+// do hands a request to the Run goroutine and waits for its result, at
+// most timeout. accepted is false when Run did not take the request in time
+// (nothing happened); done is false when it still runs.
+func do[T any](e *Engine, ctx context.Context, timeout time.Duration, request func(context.Context) T) (result T, accepted, done bool) {
+	results := make(chan T, 1) // buffered: a late result never blocks Run
 	wait, cancel := context.WithTimeout(ctx, timeout)
 	defer cancel()
 	select {
-	case e.requests <- wrapped:
+	case e.requests <- func(ctx context.Context) { results <- request(ctx) }:
 	case <-wait.Done():
-		return false
+		return result, false, false
 	}
 	select {
-	case <-done:
-		return true
+	case result = <-results:
+		return result, true, true
 	case <-wait.Done():
-		return false
+		return result, true, false
 	}
 }
 
@@ -363,6 +367,7 @@ func (e *Engine) checkPinned(ctx context.Context) error {
 		return err
 	}
 	e.mu.Lock()
+	e.versionsSeen = all
 	channel := e.state.Channel
 	now := e.now()
 	for key := range e.state.Seen {
@@ -504,7 +509,7 @@ func (e *Engine) readyAt(ctx context.Context, o *offer) time.Time {
 		return seen
 	}
 	out := seen
-	if o.released != nil && o.released.Before(out) && e.pinned() {
+	if o.released != nil && e.pinned() {
 		out = *o.released
 	}
 	return out.Add(e.cfg.Cooldown)
@@ -556,7 +561,6 @@ func (e *Engine) checkTag(ctx context.Context) error {
 		}
 	}
 	e.mu.Lock()
-	e.tagDigest = latest
 	if installed != nil {
 		e.installed, e.state.Installed = installed, installed.Text
 	}
@@ -655,8 +659,11 @@ func (e *Engine) autoInstall(ctx context.Context) {
 	e.mu.Lock()
 	busy := e.state.Install != nil
 	available := e.available
+	stale := e.checkErr != ""
+	e.wakeAt = time.Time{}
 	e.mu.Unlock()
-	if busy || available == nil {
+	// Only from a check that just succeeded: an older offer may be gone.
+	if busy || available == nil || stale {
 		return
 	}
 	var due *offer
@@ -667,6 +674,7 @@ func (e *Engine) autoInstall(ctx context.Context) {
 	} else if available.InstallsAt != nil && e.cfg.Window != nil && !e.cfg.Window.Contains(e.now().In(e.cfg.Location)) && !e.readyAt(ctx, available).After(e.now()) {
 		e.mu.Lock()
 		e.once("window "+available.Version, 24*time.Hour, "Waiting for the window that opens at %s.", e.cfg.Window.Text[:5])
+		e.wakeAt = e.cfg.Window.NextOpen(e.now().In(e.cfg.Location))
 		e.mu.Unlock()
 	}
 	if due == nil {
@@ -683,12 +691,9 @@ func (e *Engine) dueVersion(ctx context.Context) *offer {
 	e.mu.Lock()
 	installed := e.installed
 	channel := e.state.Channel
+	all := e.versionsSeen
 	e.mu.Unlock()
 	if installed == nil {
-		return nil
-	}
-	all, err := e.versions(ctx)
-	if err != nil {
 		return nil
 	}
 	now := e.now()
@@ -720,6 +725,7 @@ func (e *Engine) dueVersion(ctx context.Context) *offer {
 		if e.cfg.Window != nil && !e.cfg.Window.Contains(now.In(e.cfg.Location)) {
 			e.mu.Lock()
 			e.once("window "+v.Text, 24*time.Hour, "%s waits for the window that opens at %s.", v.Text, e.cfg.Window.Text[:5])
+			e.wakeAt = e.cfg.Window.NextOpen(now.In(e.cfg.Location))
 			e.mu.Unlock()
 			return nil
 		}
@@ -772,22 +778,31 @@ func (e *Engine) install(ctx context.Context, o *offer, manual bool) error {
 		e.save()
 		return nil
 	case e.pinned():
+		// Saved before the request: if this container stops right after, the
+		// next one still knows which result to wait for.
+		e.state.Install = &Install{ID: id, Version: o.Version, Previous: previous, StartedAt: e.now(), Manual: manual, Stage: "requested"}
+		e.save()
 		request := fmt.Sprintf("protocol=2\nid=%s\nversion=%s\n", id, o.Version)
 		if err := writeAtomic(e.path("deploy"), []byte(request), 0o644); err != nil {
+			e.state.Install = nil
+			e.save()
 			return fmt.Errorf("Cannot write to %s: %v", e.cfg.Trigger, err)
 		}
-		e.state.Install = &Install{ID: id, Version: o.Version, Previous: previous, StartedAt: e.now(), Manual: manual, Stage: "requested"}
 		e.logf("Asking the host to install %s.", o.Version)
 	default:
-		// A host setup of updater 0.1: it deploys what the tag points to.
+		// A host setup of updater 0.1 (or no VERSION_VARIABLE): the host
+		// deploys what the tag points to. Previous keeps the digest before.
+		e.state.Install = &Install{ID: id, Version: o.Version, Previous: e.state.InstalledDigest, StartedAt: e.now(), Manual: manual, Stage: "deploying", Legacy: true}
+		e.state.InstalledDigest = o.digest
+		e.save()
 		if err := writeAtomic(e.path("deploy"), []byte(o.digest+"\n"), 0o644); err != nil {
+			e.state.InstalledDigest = e.state.Install.Previous
+			e.state.Install = nil
+			e.save()
 			return fmt.Errorf("Cannot write to %s: %v", e.cfg.Trigger, err)
 		}
-		e.state.InstalledDigest = o.digest
-		e.state.Install = &Install{ID: id, Version: o.Version, Previous: previous, StartedAt: e.now(), Manual: manual, Stage: "deploying", Legacy: true}
 		e.logf("Asking the host to deploy.")
 	}
-	e.save()
 	return nil
 }
 
@@ -903,6 +918,10 @@ func (e *Engine) pollHost() {
 // again.
 func (e *Engine) abandon(install *Install) {
 	_ = os.Remove(e.path("deploy"))
+	if install.Legacy {
+		// Nothing was deployed: the next check offers the image again.
+		e.state.InstalledDigest = install.Previous
+	}
 	e.logf("No host picked up the installation of %s.", install.Version)
 	e.state.Last = &Last{Version: install.Version, Result: "failed",
 		Message:    fmt.Sprintf("The server did not pick up the installation within 10 minutes. Check that %s.path is active (systemctl status %s.path).", e.projectHint(), e.projectHint()),

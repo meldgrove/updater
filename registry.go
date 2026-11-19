@@ -78,10 +78,22 @@ func (r *Registry) do(ctx context.Context, method, target string, accept string)
 	if response.StatusCode != http.StatusUnauthorized {
 		return response, nil
 	}
-	challenge := response.Header.Get("WWW-Authenticate")
+	challenges := response.Header.Values("WWW-Authenticate")
 	drain(response)
-	token, err := r.signIn(ctx, challenge)
-	if err != nil || token == "" {
+	token := ""
+	for _, scheme := range []string{"bearer", "basic"} {
+		for _, challenge := range challenges {
+			if strings.EqualFold(strings.SplitN(challenge, " ", 2)[0], scheme) {
+				if found, err := r.signIn(ctx, challenge); err == nil && found != "" {
+					token = found
+				}
+			}
+		}
+		if token != "" {
+			break
+		}
+	}
+	if token == "" {
 		return nil, errRefused
 	}
 	r.mu.Lock()
@@ -117,13 +129,14 @@ func (r *Registry) signIn(ctx context.Context, challenge string) (string, error)
 	if fields["realm"] == "" {
 		return "", errRefused
 	}
-	query := url.Values{"scope": {"repository:" + r.repository + ":pull"}}
-	if fields["service"] != "" {
-		query.Set("service", fields["service"])
-	}
 	realm, err := url.Parse(fields["realm"])
 	if err != nil {
 		return "", err
+	}
+	query := realm.Query()
+	query.Set("scope", "repository:"+r.repository+":pull")
+	if fields["service"] != "" {
+		query.Set("service", fields["service"])
 	}
 	realm.RawQuery = query.Encode()
 	request, err := http.NewRequestWithContext(ctx, http.MethodGet, realm.String(), nil)
@@ -207,6 +220,10 @@ func (r *Registry) Tags(ctx context.Context) ([]string, error) {
 		}
 		tags = append(tags, list.Tags...)
 		next = nextPage(response.Header.Get("Link"), response.Request.URL)
+		// The registry's credentials go only to the registry.
+		if parsed, err := url.Parse(next); next != "" && (err != nil || parsed.Host != r.host) {
+			next = ""
+		}
 	}
 	return tags, nil
 }

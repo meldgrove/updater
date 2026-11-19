@@ -56,9 +56,17 @@ unit=meldgrove-updater-$project
 
 if [ "$action" = remove ]; then
   systemctl disable --now "$unit.path" > /dev/null 2>&1 || true
+  # An installation that runs keeps its backup of .env until it ends.
+  while systemctl is-active --quiet "$unit.service" 2> /dev/null; do
+    echo "Waiting for the running installation to end."
+    sleep 5
+  done
   rm -f "$units/$unit.path" "$units/$unit.service"
   systemctl daemon-reload
-  if [ -n "$trigger" ]; then
+  if [ -n "$container" ] && docker exec "$container" updater host-unwatch 2> /dev/null; then
+    :
+  elif [ -n "$trigger" ]; then
+    # rm removes links themselves, never what they point to.
     rm -f "$trigger/watched" "$trigger/deploy" "$trigger/progress" "$trigger/result"
   fi
   rm -rf "/var/lib/meldgrove-updater/$project"
@@ -84,18 +92,24 @@ cat > "$lib/deploy.new" << 'EOF'
 # what the updater of a Docker Compose project asks for. systemd starts it
 # when the updater leaves its request in the volume at /trigger.
 #
-#   deploy <project>           install the requested version (or, for an
-#                              updater 0.1 request, the newest image of the tag)
+#   deploy <project>           install the requested version (or, for a
+#                              request without version, the newest image of
+#                              the tag)
 #   deploy <project> updater   recreate only the updater container
 #
 # A version is installed by writing it to the variable VERSION_VARIABLE (from
-# the updater's environment) in .env, pulling the image, and docker compose up
-# --wait. When that fails, .env goes back to what it was and the version
-# before starts again. The result goes to /trigger/result for the updater.
+# the updater's environment) in the env file, pulling the image, and docker
+# compose up --wait. When that fails, the env file goes back to what it was
+# and the version before starts again.
+#
+# The volume belongs to the unprivileged updater, so this script, which runs
+# as root, never reads or writes it: it takes the request and reports the
+# result with docker exec, as the updater's own user.
 set -eu
 project=${1:?Usage: deploy <project> [updater]}
 mode=${2:-app}
 state=/var/lib/meldgrove-updater/$project
+# The updater container: the newest one, also while stopped.
 container=$(docker ps --all --quiet --filter "label=com.docker.compose.project=$project" \
   --filter label=com.docker.compose.service=updater | head -n 1)
 if [ -z "$container" ]; then
@@ -110,7 +124,12 @@ setting() { inspect '{{range .Config.Env}}{{println .}}{{end}}' | sed -n "s/^$1=
 image=$(setting IMAGE)
 variable=$(setting VERSION_VARIABLE)
 updater_image=$(inspect '{{.Config.Image}}')
-trigger=$(inspect '{{range .Mounts}}{{if eq .Destination "/trigger"}}{{.Source}}{{end}}{{end}}')
+# updater <command…>: run the updater's command in its running container.
+updater() {
+  running=$(docker ps --quiet --filter "label=com.docker.compose.project=$project" \
+    --filter label=com.docker.compose.service=updater | head -n 1)
+  [ -n "$running" ] && docker exec "$running" updater "$@"
+}
 
 # The Compose files and env files of the last docker compose up, as arguments.
 set -f
@@ -124,11 +143,13 @@ for file do
   set -- "$@" --file "$file"
 done
 shift "$count"
-first_env=""
+env_list=""
 if [ -n "$env_files" ]; then
   IFS=,
   for env_file in $env_files; do
-    [ -n "$first_env" ] || first_env=$env_file
+    case $env_file in /*) ;; *) env_file=$directory/$env_file ;; esac
+    env_list="$env_list$env_file
+"
     set -- "$@" --env-file "$env_file"
   done
   IFS=$old_ifs
@@ -140,20 +161,20 @@ compose() {
 
 if [ "$mode" = updater ]; then
   # "$@" holds the --file and --env-file arguments.
-  docker compose --ansi never --project-name "$project" --project-directory "$directory" "$@" \
-    up --detach --no-deps --force-recreate --quiet-pull updater
+  compose "$@" up --detach --no-deps --force-recreate --quiet-pull updater
   exit
 fi
 
-request=""
-if [ -n "$trigger" ] && [ -f "$trigger/deploy" ]; then
-  request=$(head -c 4096 "$trigger/deploy")
-  rm -f "$trigger/deploy"
-fi
+request=$(updater host-request 2> /dev/null || true)
 field() { printf '%s\n' "$request" | sed -n "s/^$1=//p" | head -n 1; }
 
 if [ "$(field protocol)" != 2 ]; then
-  # A request of updater 0.1: the newest image of the tag.
+  # A request without version (updater 0.1, or no VERSION_VARIABLE): the
+  # newest image of the tag.
+  if ! printf '%s\n' "$request" | grep -Eqx 'sha256:[0-9a-f]{64}'; then
+    echo "No valid request from the updater; nothing to install."
+    exit 0
+  fi
   echo "Installing the newest image of $image."
   docker pull --quiet "$image"
   docker pull --quiet "$updater_image" || echo "Could not pull the updater's image; it keeps the one it has." >&2
@@ -165,21 +186,19 @@ id=$(field id)
 version=$(field version)
 case $id in '' | *[!0-9a-f]*) echo "The request has no valid id." >&2 && exit 1 ;; esac
 
-# report <file> <lines…>: a file for the updater, which runs as another user.
-# (POSIX sh has no local variables: names here must not clash.)
-report() {
-  report_file=$trigger/$1
-  shift
-  printf '%s\n' "$@" > "$report_file.new"
-  chmod 0644 "$report_file.new"
-  mv "$report_file.new" "$report_file"
-}
-progress() { report progress "id=$id" "stage=$1"; }
-# finish <result> <message>: the outcome, also in the journal.
+progress() { updater host-report progress "$id" "$1" > /dev/null 2>&1 || true; }
+# finish <result> <message>: the outcome for the updater, also in the journal.
+# Tried a few times: the updater container may still be starting.
 finish() {
   message=$(printf '%s' "$2" | tr '\r\n\t' '   ' | tr -cd '[:print:]' | cut -c 1-400)
-  report result "id=$id" "version=$version" "result=$1" "message=$message" "finished=$(date +%s)"
   echo "$1: $version${message:+ ($message)}"
+  for _ in 1 2 3 4 5 6; do
+    if updater host-report result "$id" "$version" "$1" "$message" > /dev/null 2>&1; then
+      return 0
+    fi
+    sleep 5
+  done
+  echo "Could not report the result to the updater." >&2
 }
 # last_error <log>: the line of a docker compose log that says what failed.
 last_error() {
@@ -196,20 +215,50 @@ if ! printf '%s\n' "$variable" | grep -Eqx '[A-Za-z_][A-Za-z0-9_]*'; then
   finish failed "The updater has no VERSION_VARIABLE, so the server cannot choose a version. Update compose.yaml."
   exit 1
 fi
-# The image's repository from the updater's IMAGE, never from the request.
+# The image's repository and the version that runs now, from the updater's
+# IMAGE, never from the request.
 name=${image%@*}
-case ${name##*/} in *:*) repository=${name%:*} ;; *) repository=$name ;; esac
+case ${name##*/} in *:*) repository=${name%:*} before=${name##*:} ;; *) repository=$name before="" ;; esac
 target=$repository:$version
-env_file=${first_env:-$directory/.env}
-case $env_file in /*) ;; *) env_file=$directory/$env_file ;; esac
+
+# The env file to change: the last one that sets the variable (Compose reads
+# them in order), else the first, else .env.
+assignment="^[[:space:]]*(export[[:space:]]+)?${variable}[[:space:]]*="
+env_file=""
+first_env=""
+while IFS= read -r candidate; do
+  [ -n "$candidate" ] || continue
+  [ -n "$first_env" ] || first_env=$candidate
+  if [ -f "$candidate" ] && grep -Eq "$assignment" "$candidate"; then
+    env_file=$candidate
+  fi
+done << LIST
+$env_list
+LIST
+env_file=${env_file:-${first_env:-$directory/.env}}
 if [ ! -f "$env_file" ]; then
   finish failed "There is no $env_file to write $variable to."
   exit 1
 fi
+env_file=$(readlink -f "$env_file")
 
 mkdir -p "$state"
 chmod 0700 "$state"
 log=$state/install.log
+# replace_env <file>: put the file's content in place of the env file, in
+# one step, with the env file's owner and mode.
+replace_env() {
+  next=$(mktemp "$env_file.XXXXXX")
+  if cat "$1" > "$next" && chmod --reference="$env_file" "$next" && chown --reference="$env_file" "$next" &&
+    mv -f "$next" "$env_file"; then
+    return 0
+  fi
+  rm -f "$next"
+  return 1
+}
+# restart <log>: what docker compose up says, and whether it succeeded.
+restart() { compose "$@" up --detach --wait --wait-timeout 900 --quiet-pull > "$log" 2>&1; }
+
 echo "Installing $target."
 progress pulling
 if ! docker pull --quiet "$target" > "$log" 2>&1; then
@@ -219,8 +268,7 @@ if ! docker pull --quiet "$target" > "$log" 2>&1; then
 fi
 docker pull --quiet "$updater_image" > /dev/null 2>&1 || echo "Could not pull the updater's image; it keeps the one it has." >&2
 
-# .env keeps its owner, mode and comments; every line of the variable gets
-# the version, and the variable is added when it is missing.
+# Every assignment of the variable gets the version; it is added when missing.
 cp "$env_file" "$state/env.before"
 awk -v name="$variable" -v value="$version" '
   BEGIN { pattern = "^[ \t]*(export[ \t]+)?" name "[ \t]*=" }
@@ -228,15 +276,23 @@ awk -v name="$variable" -v value="$version" '
   { print }
   END { if (!found) print name "=" value }
 ' "$state/env.before" > "$state/env.next"
-cat "$state/env.next" > "$env_file"
-rm -f "$state/env.next"
+if ! replace_env "$state/env.next"; then
+  finish failed "Could not write $env_file."
+  exit 1
+fi
+# Compose must now run the version: another env file, the shell or a value
+# that spans lines could still decide otherwise.
+if ! compose "$@" config --images 2> "$log" | grep -Fqx "$target"; then
+  replace_env "$state/env.before" || echo "Could not restore $env_file from $state/env.before." >&2
+  finish failed "After writing $variable=$version to $env_file, Docker Compose still does not run $target. Check where $variable is set."
+  exit 1
+fi
 
 progress starting
-if compose "$@" up --detach --wait --wait-timeout 900 --quiet-pull > "$log" 2>&1; then
+if restart "$@"; then
   cat "$log"
   finish installed ""
   # Keep this version and the one before; untag older images of the app.
-  before=$(sed -n "s/^[[:space:]]*\(export[[:space:]]*\)\{0,1\}${variable}[[:space:]]*=[[:space:]]*//p" "$state/env.before" | tail -n 1 | tr -d "\"'")
   docker image ls "$repository" --format '{{.Tag}}' | while read -r tag; do
     case $tag in "$version" | "$before" | '<none>') continue ;; esac
     if printf '%s\n' "$tag" | grep -Eqx '[0-9]+\.[0-9]+\.[0-9]+(-preview\.[0-9]+)?'; then
@@ -249,12 +305,15 @@ cat "$log" >&2
 failure=$(last_error "$log")
 echo "$target did not start: $failure. Going back." >&2
 progress rolling-back
-cat "$state/env.before" > "$env_file"
-if compose "$@" up --detach --wait --wait-timeout 900 --quiet-pull > "$state/rollback.log" 2>&1; then
+if ! replace_env "$state/env.before"; then
+  finish failed "$failure. Could not restore $env_file; the backup is $state/env.before."
+  exit 1
+fi
+if restart "$@"; then
   finish rolled-back "$failure"
 else
-  cat "$state/rollback.log" >&2
-  finish failed "$failure. The version before did not start again either: $(last_error "$state/rollback.log")"
+  cat "$log" >&2
+  finish failed "$failure. The version before did not start again either: $(last_error "$log")"
 fi
 exit 1
 EOF
@@ -286,13 +345,14 @@ ExecStart=$lib/deploy $project
 TimeoutStartSec=45min
 EOF
 
-# The updater runs as an unprivileged user and writes its requests here.
+# The updater runs as an unprivileged user and writes its requests here. It
+# marks the volume as watched itself: root writes nothing into it.
 variable=$(inspect '{{range .Config.Env}}{{println .}}{{end}}' | sed -n 's/^VERSION_VARIABLE=//p' | head -n 1)
 owner=$(inspect '{{.Config.User}}')
 chown "${owner:-65534:65534}" "$trigger"
-rm -f "$trigger/deploy"
-printf 'protocol=2\nproject=%s\n' "$project" > "$trigger/watched"
-chmod 0644 "$trigger/watched"
+[ "$(inspect '{{.State.Running}}')" = true ] || fail "The updater container does not run. Start the app first (docker compose up -d)."
+docker exec "$container" updater host-watch "$project" ||
+  fail "The updater cannot take the host setup. Update compose.yaml to updater 0.2 or later, then run docker compose up -d."
 systemctl daemon-reload
 systemctl enable --now "$unit.path" > /dev/null 2>&1
 # A new updater container reads that the host watches it.

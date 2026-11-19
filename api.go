@@ -137,10 +137,15 @@ func (e *Engine) Handler(ctx context.Context) http.Handler {
 		writeJSON(w, http.StatusOK, e.Status())
 	})
 	mux.HandleFunc("POST /v1/check", func(w http.ResponseWriter, r *http.Request) {
-		e.do(ctx, 30*time.Second, func(ctx context.Context) {
+		_, accepted, _ := do(e, r.Context(), 30*time.Second, func(ctx context.Context) bool {
 			e.check(ctx)
 			e.autoInstall(ctx)
+			return true
 		})
+		if !accepted {
+			writeJSON(w, http.StatusServiceUnavailable, map[string]string{"error": "The updater is busy. Try again in a minute."})
+			return
+		}
 		writeJSON(w, http.StatusOK, e.Status())
 	})
 	mux.HandleFunc("POST /v1/install", func(w http.ResponseWriter, r *http.Request) {
@@ -154,9 +159,16 @@ func (e *Engine) Handler(ctx context.Context) http.Handler {
 			writeJSON(w, http.StatusBadRequest, map[string]string{"error": "Name the version to install."})
 			return
 		}
-		var failure error
-		if !e.do(ctx, 15*time.Second, func(ctx context.Context) { failure = e.manualInstall(ctx, body.Version) }) {
+		failure, accepted, done := do(e, r.Context(), 15*time.Second, func(ctx context.Context) error {
+			return e.manualInstall(ctx, body.Version)
+		})
+		switch {
+		case !accepted:
 			failure = apiError{http.StatusServiceUnavailable, "The updater is busy. Try again in a minute."}
+		case !done:
+			// Still calling the deploy link: the status tells how it ends.
+			writeJSON(w, http.StatusAccepted, e.Status())
+			return
 		}
 		if failure != nil {
 			status := http.StatusConflict
@@ -184,17 +196,26 @@ func (e *Engine) Handler(ctx context.Context) http.Handler {
 			writeJSON(w, http.StatusConflict, map[string]string{"error": locked})
 			return
 		}
-		e.do(ctx, 30*time.Second, func(ctx context.Context) {
+		_, accepted, _ := do(e, r.Context(), 30*time.Second, func(ctx context.Context) bool {
 			e.mu.Lock()
 			changed := e.state.Channel != body.Channel
 			e.state.Channel = body.Channel
+			if changed {
+				// Offers of the other channel are gone, even if the check fails.
+				e.available, e.attention = nil, nil
+			}
 			e.save()
 			e.mu.Unlock()
 			if changed {
 				e.logf("Channel: %s.", body.Channel)
 			}
 			e.check(ctx)
+			return true
 		})
+		if !accepted {
+			writeJSON(w, http.StatusServiceUnavailable, map[string]string{"error": "The updater is busy. Try again in a minute."})
+			return
+		}
 		writeJSON(w, http.StatusOK, e.Status())
 	})
 	mux.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
