@@ -111,9 +111,12 @@ sh updater-setup.sh
 
 The second line writes the setup script from the updater's image; read it
 before you run it as root. It installs `meldgrove-updater-<project>.path` and
-`.service` in `/etc/systemd/system` and their deploy script in
-`/usr/local/lib/meldgrove-updater` (`<project>` is the Docker Compose project,
-by default the folder's name). For each installation the deploy script:
+`.service` in `/etc/systemd/system` and their deploy script
+`/usr/local/lib/meldgrove-updater/deploy-2` (`<project>` is the Docker Compose
+project, by default the folder's name; apps on the server that still run
+updater 0.1 keep their `deploy`). The deploy script runs as root but never
+touches the updater's volume: it takes the request and reports back with
+`docker exec`, as the updater's own user. For each installation it:
 
 1. takes the version from the updater's request (it accepts nothing but a
    version number) and the image repository and `VERSION_VARIABLE` from the
