@@ -41,7 +41,7 @@ jobs:
         run: |
           shellcheck host-setup.sh test/run.sh test/host.sh
           # The deploy script that host-setup.sh writes to the server.
-          deploy=$(sed -n "/^cat > \"\$lib\/deploy.new\" << 'EOF'\$/,/^EOF\$/p" host-setup.sh | sed '1d;$d')
+          deploy=$(sed -n "/^cat > \"\$deploy.new\" << 'EOF'\$/,/^EOF\$/p" host-setup.sh | sed '1d;$d')
           test -n "$deploy"
           printf '%s\n' "$deploy" | shellcheck --shell=sh -
 

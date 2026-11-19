@@ -33,7 +33,8 @@ type Install struct {
 	StartedAt time.Time `json:"startedAt"`
 	Manual    bool      `json:"manual"`
 	Stage     string    `json:"stage"`
-	Legacy    bool      `json:"legacy,omitempty"` // a host setup of updater 0.1 reports no result
+	Legacy    bool      `json:"legacy,omitempty"`    // a host setup of updater 0.1 reports no result
+	Published bool      `json:"published,omitempty"` // the request is written
 }
 
 // Last is the outcome of the last installation.

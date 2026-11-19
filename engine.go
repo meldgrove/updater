@@ -133,10 +133,12 @@ func (e *Engine) channelLocked() string {
 	}
 }
 
-func (e *Engine) save() {
-	if err := e.state.save(e.path("state.json")); err != nil {
+func (e *Engine) save() error {
+	err := e.state.save(e.path("state.json"))
+	if err != nil {
 		e.once("save", 24*time.Hour, "Cannot keep the state in %s: %v", e.cfg.Trigger, err)
 	}
+	return err
 }
 
 // once logs a message at most once per period for its key.
@@ -219,6 +221,8 @@ func (e *Engine) Run(ctx context.Context) {
 			e.pollHost()
 		case request := <-e.requests:
 			request(ctx)
+			// A check or a new channel may bring an update due sooner.
+			timer.Reset(e.nextCheck())
 		}
 	}
 }
@@ -719,15 +723,25 @@ func (e *Engine) dueVersion(ctx context.Context) *offer {
 		if o.released == nil && channel == "stable" {
 			o = e.describe(ctx, v, *installed, all)
 		}
-		if e.readyAt(ctx, o).After(now) {
-			continue
+		cooled := e.readyAt(ctx, o)
+		ready := cooled
+		if e.cfg.Window != nil {
+			if ready.Before(now) {
+				ready = now
+			}
+			ready = e.cfg.Window.NextOpen(ready.In(e.cfg.Location))
 		}
-		if e.cfg.Window != nil && !e.cfg.Window.Contains(now.In(e.cfg.Location)) {
+		if ready.After(now) {
+			// Wake for the earliest candidate that becomes due.
 			e.mu.Lock()
-			e.once("window "+v.Text, 24*time.Hour, "%s waits for the window that opens at %s.", v.Text, e.cfg.Window.Text[:5])
-			e.wakeAt = e.cfg.Window.NextOpen(now.In(e.cfg.Location))
+			if e.wakeAt.IsZero() || ready.Before(e.wakeAt) {
+				e.wakeAt = ready
+			}
+			if !cooled.After(now) {
+				e.once("window "+v.Text, 24*time.Hour, "%s waits for the window that opens at %s.", v.Text, e.cfg.Window.Text[:5])
+			}
 			e.mu.Unlock()
-			return nil
+			continue
 		}
 		return o
 	}
@@ -781,26 +795,37 @@ func (e *Engine) install(ctx context.Context, o *offer, manual bool) error {
 		// Saved before the request: if this container stops right after, the
 		// next one still knows which result to wait for.
 		e.state.Install = &Install{ID: id, Version: o.Version, Previous: previous, StartedAt: e.now(), Manual: manual, Stage: "requested"}
-		e.save()
+		if err := e.save(); err != nil {
+			e.state.Install = nil
+			return fmt.Errorf("Cannot keep the state in %s, so nothing is installed: %v", e.cfg.Trigger, err)
+		}
 		request := fmt.Sprintf("protocol=2\nid=%s\nversion=%s\n", id, o.Version)
 		if err := writeAtomic(e.path("deploy"), []byte(request), 0o644); err != nil {
 			e.state.Install = nil
 			e.save()
 			return fmt.Errorf("Cannot write to %s: %v", e.cfg.Trigger, err)
 		}
+		e.state.Install.Published = true
+		_ = e.save()
 		e.logf("Asking the host to install %s.", o.Version)
 	default:
 		// A host setup of updater 0.1 (or no VERSION_VARIABLE): the host
 		// deploys what the tag points to. Previous keeps the digest before.
 		e.state.Install = &Install{ID: id, Version: o.Version, Previous: e.state.InstalledDigest, StartedAt: e.now(), Manual: manual, Stage: "deploying", Legacy: true}
 		e.state.InstalledDigest = o.digest
-		e.save()
+		if err := e.save(); err != nil {
+			e.state.InstalledDigest = e.state.Install.Previous
+			e.state.Install = nil
+			return fmt.Errorf("Cannot keep the state in %s, so nothing is installed: %v", e.cfg.Trigger, err)
+		}
 		if err := writeAtomic(e.path("deploy"), []byte(o.digest+"\n"), 0o644); err != nil {
 			e.state.InstalledDigest = e.state.Install.Previous
 			e.state.Install = nil
 			e.save()
 			return fmt.Errorf("Cannot write to %s: %v", e.cfg.Trigger, err)
 		}
+		e.state.Install.Published = true
+		_ = e.save()
 		e.logf("Asking the host to deploy.")
 	}
 	return nil
@@ -868,7 +893,10 @@ func (e *Engine) pollHost() {
 	pending := exists(e.path("deploy"))
 	age := e.now().Sub(install.StartedAt)
 	if install.Legacy {
-		if !pending {
+		if !pending && !install.Published {
+			// The updater stopped before it wrote the request.
+			e.abandon(install)
+		} else if !pending {
 			e.logf("The host deploys it now.")
 			e.finish(Last{Version: install.Version, Result: "accepted", FinishedAt: e.now()})
 		} else if age > 10*time.Minute {

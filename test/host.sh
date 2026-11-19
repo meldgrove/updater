@@ -204,12 +204,17 @@ services:
 volumes:
   updater:
 EOF
-printf '# The app of the host test\nCOMPOSE_PROJECT_NAME=%s\nAPP_TAG=1.0.0\nOTHER=kept\n' "$pinned" > "$pinned_dir/.env"
+# Compose also reads KEY: value lines in .env.
+printf '# The app of the host test\nCOMPOSE_PROJECT_NAME=%s\nAPP_TAG: 1.0.0\nOTHER=kept\n' "$pinned" > "$pinned_dir/.env"
 chmod 0640 "$pinned_dir/.env"
 cd "$pinned_dir"
 pinned_compose up --detach --wait --quiet-pull 2> /dev/null || fail "the pinned app did not start"
 docker compose run --rm -T updater host-setup > updater-setup.sh
+# Another app on the server still runs updater 0.1 with its deploy script.
+as_root sh -c 'mkdir -p /usr/local/lib/meldgrove-updater && printf "#!/bin/sh\n# updater 0.1\n" > /usr/local/lib/meldgrove-updater/deploy'
 as_root sh updater-setup.sh > setup.log || fail "the setup of the pinned app failed: $(cat setup.log)"
+grep -qx "# updater 0.1" /usr/local/lib/meldgrove-updater/deploy || fail "the setup replaced the deploy script of updater 0.1"
+as_root rm /usr/local/lib/meldgrove-updater/deploy
 grep -q "writes each version it installs to APP_TAG" setup.log || fail "the setup did not name the variable: $(cat setup.log)"
 eventually 20 status_has '.mode == "host" and .channelLocked == null and .installed == "1.0.0"' || fail "unexpected status: $(status)"
 pass "a host setup of protocol 2 lets the app choose versions"

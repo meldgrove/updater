@@ -34,6 +34,9 @@ docker compose up --help 2> /dev/null | grep -q -- '--wait-timeout' ||
   fail "Docker Compose is too old: it needs 'up --wait-timeout' (Compose 2.20 or later)."
 
 lib=/usr/local/lib/meldgrove-updater
+# Protocol 2. The deploy script of updater 0.1 ($lib/deploy) stays as it is
+# for apps on this server that still run updater 0.1.
+deploy=$lib/deploy-2
 units=/etc/systemd/system
 found=$(docker compose ps --all --quiet updater) ||
   fail "Docker Compose cannot read the app here. Run this in the app's folder."
@@ -57,7 +60,8 @@ unit=meldgrove-updater-$project
 if [ "$action" = remove ]; then
   systemctl disable --now "$unit.path" > /dev/null 2>&1 || true
   # An installation that runs keeps its backup of .env until it ends.
-  while systemctl is-active --quiet "$unit.service" 2> /dev/null; do
+  while [ "$(systemctl show --property=ActiveState --value "$unit.service" 2> /dev/null)" = activating ] ||
+    [ -n "$(systemctl list-jobs --no-legend "$unit.service" 2> /dev/null)" ]; do
     echo "Waiting for the running installation to end."
     sleep 5
   done
@@ -71,7 +75,9 @@ if [ "$action" = remove ]; then
   fi
   rm -rf "/var/lib/meldgrove-updater/$project"
   # A new updater container reads that no host watches it any more.
-  if [ -n "$container" ] && [ -x "$lib/deploy" ]; then
+  if [ -n "$container" ] && [ -x "$deploy" ]; then
+    "$deploy" "$project" updater
+  elif [ -n "$container" ] && [ -x "$lib/deploy" ]; then
     "$lib/deploy" "$project" updater
   fi
   if ! ls "$units"/meldgrove-updater-*.path > /dev/null 2>&1; then
@@ -86,7 +92,7 @@ fi
 case $trigger in *[!A-Za-z0-9._/@+-]*) fail "The volume's path has characters that a systemd unit cannot hold: $trigger" ;; esac
 
 mkdir -p "$lib"
-cat > "$lib/deploy.new" << 'EOF'
+cat > "$deploy.new" << 'EOF'
 #!/bin/sh
 # Meldgrove Updater (host protocol 2), written by its host setup: installs
 # what the updater of a Docker Compose project asks for. systemd starts it
@@ -165,13 +171,28 @@ if [ "$mode" = updater ]; then
   exit
 fi
 
-request=$(updater host-request 2> /dev/null || true)
+# The request, taken from the updater. docker exec fails while the updater
+# restarts: try again for about a minute, then fail, and systemd starts this
+# again while the request waits.
+request=""
+taken=false
+for wait in 2 4 8 16 30; do
+  if request=$(updater host-request 2> /dev/null); then
+    taken=true
+    break
+  fi
+  sleep "$wait"
+done
+if [ "$taken" != true ]; then
+  echo "The updater did not hand over its request; trying again." >&2
+  exit 1
+fi
 field() { printf '%s\n' "$request" | sed -n "s/^$1=//p" | head -n 1; }
 
 if [ "$(field protocol)" != 2 ]; then
   # A request without version (updater 0.1, or no VERSION_VARIABLE): the
   # newest image of the tag.
-  if ! printf '%s\n' "$request" | grep -Eqx 'sha256:[0-9a-f]{64}'; then
+  if [ "$(printf '%s\n' "$request" | wc -l)" != 1 ] || ! printf '%s\n' "$request" | grep -Eqx 'sha256:[0-9a-f]{64}'; then
     echo "No valid request from the updater; nothing to install."
     exit 0
   fi
@@ -223,7 +244,7 @@ target=$repository:$version
 
 # The env file to change: the last one that sets the variable (Compose reads
 # them in order), else the first, else .env.
-assignment="^[[:space:]]*(export[[:space:]]+)?${variable}[[:space:]]*="
+assignment="^[[:space:]]*(export[[:space:]]+)?${variable}[[:space:]]*[=:]"
 env_file=""
 first_env=""
 while IFS= read -r candidate; do
@@ -271,7 +292,7 @@ docker pull --quiet "$updater_image" > /dev/null 2>&1 || echo "Could not pull th
 # Every assignment of the variable gets the version; it is added when missing.
 cp "$env_file" "$state/env.before"
 awk -v name="$variable" -v value="$version" '
-  BEGIN { pattern = "^[ \t]*(export[ \t]+)?" name "[ \t]*=" }
+  BEGIN { pattern = "^[ \t]*(export[ \t]+)?" name "[ \t]*[=:]" }
   $0 ~ pattern { print name "=" value; found = 1; next }
   { print }
   END { if (!found) print name "=" value }
@@ -282,7 +303,8 @@ if ! replace_env "$state/env.next"; then
 fi
 # Compose must now run the version: another env file, the shell or a value
 # that spans lines could still decide otherwise.
-if ! compose "$@" config --images 2> "$log" | grep -Fqx "$target"; then
+images=$(compose "$@" config --images 2> "$log" | grep -F "$repository:" || true)
+if [ -z "$images" ] || printf '%s\n' "$images" | grep -Fvxq "$target"; then
   replace_env "$state/env.before" || echo "Could not restore $env_file from $state/env.before." >&2
   finish failed "After writing $variable=$version to $env_file, Docker Compose still does not run $target. Check where $variable is set."
   exit 1
@@ -317,8 +339,8 @@ else
 fi
 exit 1
 EOF
-chmod 0755 "$lib/deploy.new"
-mv "$lib/deploy.new" "$lib/deploy"
+chmod 0755 "$deploy.new"
+mv "$deploy.new" "$deploy"
 
 cat > "$units/$unit.path" << EOF
 # Meldgrove Updater: waits for the updater of $project to ask for a deployment.
@@ -338,10 +360,12 @@ cat > "$units/$unit.service" << EOF
 Description=Meldgrove Updater: install a new release of $project
 Requires=docker.service
 After=docker.service
+# The deploy script waits and retries itself; the path unit must never give up.
+StartLimitIntervalSec=0
 
 [Service]
 Type=oneshot
-ExecStart=$lib/deploy $project
+ExecStart=$deploy $project
 TimeoutStartSec=45min
 EOF
 
@@ -356,7 +380,7 @@ docker exec "$container" updater host-watch "$project" ||
 systemctl daemon-reload
 systemctl enable --now "$unit.path" > /dev/null 2>&1
 # A new updater container reads that the host watches it.
-"$lib/deploy" "$project" updater
+"$deploy" "$project" updater
 
 cat << EOF
 Automatic updates of $project are on.

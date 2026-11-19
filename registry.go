@@ -37,7 +37,17 @@ func NewRegistry(c Config) *Registry {
 		repository: c.Repository,
 		username:   c.RegistryUsername,
 		password:   c.RegistryPassword,
-		client:     &http.Client{Timeout: 30 * time.Second},
+		client: &http.Client{Timeout: 30 * time.Second, CheckRedirect: func(request *http.Request, via []*http.Request) error {
+			// Credentials go only to the registry itself, not to a CDN or
+			// another host it redirects to (Go keeps them for subdomains).
+			if first := via[0].URL; request.URL.Host != first.Host || request.URL.Scheme != first.Scheme {
+				request.Header.Del("Authorization")
+			}
+			if len(via) >= 10 {
+				return errors.New("too many redirects")
+			}
+			return nil
+		}},
 	}
 }
 
@@ -221,7 +231,7 @@ func (r *Registry) Tags(ctx context.Context) ([]string, error) {
 		tags = append(tags, list.Tags...)
 		next = nextPage(response.Header.Get("Link"), response.Request.URL)
 		// The registry's credentials go only to the registry.
-		if parsed, err := url.Parse(next); next != "" && (err != nil || parsed.Host != r.host) {
+		if parsed, err := url.Parse(next); next != "" && (err != nil || parsed.Host != r.host || parsed.Scheme != response.Request.URL.Scheme) {
 			next = ""
 		}
 	}
