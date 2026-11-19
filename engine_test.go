@@ -574,6 +574,56 @@ func TestAPIValidates(t *testing.T) {
 	}
 }
 
+func TestAPITokenGuardsEveryRequestButTheHealthCheck(t *testing.T) {
+	h := newHarness(t, map[string]string{"API_TOKEN": "s3cret-token"}, time.Time{})
+	h.registry.set("0.2.0")
+	h.engine.start()
+	handler := h.engine.Handler(context.Background())
+	for _, c := range []struct {
+		method, path, authorization, body string
+		status                            int
+	}{
+		{"GET", "/healthz", "", "", 200},
+		{"GET", "/v1/status", "", "", 401},
+		{"GET", "/v1/status", "Bearer wrong", "", 401},
+		{"GET", "/v1/status", "Bearer s3cret-toke", "", 401},
+		{"GET", "/v1/status", "Bearer s3cret-token2", "", 401},
+		{"GET", "/v1/status", "Basic s3cret-token", "", 401},
+		{"GET", "/v1/status", "s3cret-token", "", 401},
+		{"POST", "/v1/check", "", "", 401},
+		{"POST", "/v1/install", "", `{"version":"0.2.1"}`, 401},
+		{"POST", "/v1/channel", "Bearer wrong", `{"channel":"preview"}`, 401},
+		{"GET", "/v1/nothing", "", "", 401},
+		{"POST", "/healthz", "", "", 401},
+		{"GET", "/v1/status", "Bearer s3cret-token", "", 200},
+		{"GET", "/v1/status", "bearer s3cret-token", "", 200},
+		{"GET", "/v1/nothing", "Bearer s3cret-token", "", 404},
+	} {
+		request := httptest.NewRequest(c.method, c.path, strings.NewReader(c.body))
+		if c.authorization != "" {
+			request.Header.Set("Authorization", c.authorization)
+		}
+		response := httptest.NewRecorder()
+		handler.ServeHTTP(response, request)
+		if response.Code != c.status {
+			t.Errorf("%s %s with %q: %d, want %d (%s)", c.method, c.path, c.authorization, response.Code, c.status, response.Body)
+		}
+		if c.status == 401 {
+			var answer map[string]string
+			if json.Unmarshal(response.Body.Bytes(), &answer) != nil || answer["error"] == "" {
+				t.Errorf("%s %s: the refusal names no error: %s", c.method, c.path, response.Body)
+			}
+			if response.Header().Get("WWW-Authenticate") != "Bearer" {
+				t.Errorf("%s %s: no WWW-Authenticate header", c.method, c.path)
+			}
+		}
+	}
+	// A refused request changes nothing.
+	if s := h.status(); s.Channel != "stable" || s.Installing != nil {
+		t.Errorf("a refused request changed the status: %+v", s)
+	}
+}
+
 func call(t *testing.T, handler http.Handler, method, path, body string) *httptest.ResponseRecorder {
 	t.Helper()
 	request := httptest.NewRequest(method, path, strings.NewReader(body))

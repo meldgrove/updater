@@ -2,10 +2,13 @@ package main
 
 import (
 	"context"
+	"crypto/sha256"
+	"crypto/subtle"
 	"encoding/json"
 	"errors"
 	"fmt"
 	"net/http"
+	"strings"
 	"time"
 )
 
@@ -125,8 +128,9 @@ type apiError struct {
 
 func (e apiError) Error() string { return e.message }
 
-// Handler serves the API on the Compose network. It has no authentication:
-// the port is never published, and only the app calls it.
+// Handler serves the API on the Compose network, where only the app calls
+// it; the port is never published. With API_TOKEN, every request but the
+// health check needs the token (requireToken).
 func (e *Engine) Handler(ctx context.Context) http.Handler {
 	mux := http.NewServeMux()
 	mux.HandleFunc("GET /healthz", func(w http.ResponseWriter, r *http.Request) {
@@ -223,7 +227,33 @@ func (e *Engine) Handler(ctx context.Context) http.Handler {
 	mux.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, http.StatusNotFound, map[string]string{"error": "Not found."})
 	})
-	return mux
+	return requireToken(e.cfg.APIToken, mux)
+}
+
+// requireToken lets a request through only with the token as a bearer token
+// (Authorization: Bearer <token>), except GET /healthz for the container's
+// health check. Without a token, it lets every request through.
+func requireToken(token string, next http.Handler) http.Handler {
+	if token == "" {
+		return next
+	}
+	// Hashes of equal length: the comparison takes the same time for every
+	// token, whatever its length.
+	want := sha256.Sum256([]byte(token))
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method == http.MethodGet && r.URL.Path == "/healthz" {
+			next.ServeHTTP(w, r)
+			return
+		}
+		scheme, given, _ := strings.Cut(r.Header.Get("Authorization"), " ")
+		got := sha256.Sum256([]byte(strings.TrimSpace(given)))
+		if !strings.EqualFold(scheme, "Bearer") || subtle.ConstantTimeCompare(got[:], want[:]) != 1 {
+			w.Header().Set("WWW-Authenticate", "Bearer")
+			writeJSON(w, http.StatusUnauthorized, map[string]string{"error": "The updater refused the request: its API token is missing or wrong."})
+			return
+		}
+		next.ServeHTTP(w, r)
+	})
 }
 
 // manualInstall installs an offered version at once, regardless of the

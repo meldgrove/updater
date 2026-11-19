@@ -34,12 +34,17 @@ type Config struct {
 	GitHubAPI        string
 	Source           string // repository URL for release notes; empty: from the image
 
-	Listen  string // API address; "off" switches it off
-	Trigger string // the volume shared with the host and kept over deployments
-	Version string // the updater's own version
+	Listen   string // API address; "off" switches it off
+	APIToken string // bearer token every API request needs; empty: none
+	Trigger  string // the volume shared with the host and kept over deployments
+	Version  string // the updater's own version
 }
 
 var variablePattern = regexp.MustCompile(`^[A-Za-z_][A-Za-z0-9_]*$`)
+
+// tokenPattern: what a header carries unchanged, such as the output of
+// openssl rand -base64 32.
+var tokenPattern = regexp.MustCompile(`^[\x21-\x7e]+$`)
 
 // LoadConfig reads the environment. getenv is os.Getenv outside tests.
 func LoadConfig(getenv func(string) string) (Config, error) {
@@ -55,6 +60,7 @@ func LoadConfig(getenv func(string) string) (Config, error) {
 		GitHubAPI:        orDefault(getenv("GITHUB_API_URL"), "https://api.github.com"),
 		Source:           getenv("SOURCE"),
 		Listen:           orDefault(getenv("LISTEN"), ":8080"),
+		APIToken:         getenv("API_TOKEN"),
 		Trigger:          orDefault(getenv("TRIGGER_DIR"), "/trigger"),
 		Version:          getenv("APP_VERSION"),
 		TimeZone:         orDefault(getenv("TZ"), "UTC"),
@@ -64,6 +70,9 @@ func LoadConfig(getenv func(string) string) (Config, error) {
 	}
 	if err := c.parseImage(); err != nil {
 		return c, err
+	}
+	if c.APIToken != "" && !tokenPattern.MatchString(c.APIToken) {
+		return c, errors.New("API_TOKEN may hold only visible ASCII characters, without spaces, such as the output of openssl rand -base64 32.")
 	}
 	if c.VersionVariable != "" && !variablePattern.MatchString(c.VersionVariable) {
 		return c, fmt.Errorf("VERSION_VARIABLE must be the name of a variable, such as HANDBOOK_VERSION")
