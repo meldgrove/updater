@@ -174,7 +174,7 @@ the update button, and the app checks that before it calls the API.
 | --- | --- |
 | `GET /v1/status` | `200` Status (no network calls) |
 | `POST /v1/check` | checks now (up to 30 s), then `200` Status |
-| `POST /v1/install` `{"version": "0.2.1"}` | `202` Status; `409` when the version is not offered, an installation runs, or nothing can install |
+| `POST /v1/install` `{"version": "0.2.1"}` | `202` Status (within 8 s, also while a deploy link still answers); `409` when the version is not offered, an installation runs, or nothing can install |
 | `POST /v1/channel` `{"channel": "stable"}` | saves and checks, then `200` Status; `409` when the platform's tag decides |
 | `GET /healthz` | `200 ok` |
 

@@ -159,7 +159,9 @@ func (e *Engine) Handler(ctx context.Context) http.Handler {
 			writeJSON(w, http.StatusBadRequest, map[string]string{"error": "Name the version to install."})
 			return
 		}
-		failure, accepted, done := do(e, r.Context(), 15*time.Second, func(ctx context.Context) error {
+		// At most 8 s, below the 10 s that apps wait: a deploy link that takes
+		// longer answers 202, and the status tells how it ends.
+		failure, accepted, done := do(e, r.Context(), 8*time.Second, func(ctx context.Context) error {
 			return e.manualInstall(ctx, body.Version)
 		})
 		switch {
