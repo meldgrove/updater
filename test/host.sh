@@ -240,7 +240,9 @@ status_has '.last.message | test("unhealthy")' || fail "the rollback does not sa
 sleep 5
 status_has '.installing == null and .available.failed != null' || fail "the failed version is tried again: $(status)"
 pass "an unhealthy release goes back to the version before and is not tried again"
-[ "$(cat "$canary")" = untouched ] && [ "$(stat -c %a "$canary")" = 600 ] || fail "the deploy script followed a link in the volume"
+if [ "$(cat "$canary")" != untouched ] || [ "$(stat -c %a "$canary")" != 600 ]; then
+  fail "the deploy script followed a link in the volume"
+fi
 rm -f "$canary"
 pass "links in the volume do not redirect the root deploy script"
 
