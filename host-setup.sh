@@ -118,7 +118,7 @@ state=/var/lib/meldgrove-updater/$project
 # The updater container: the newest one, also while stopped.
 # Waits up to about a minute: Compose may be recreating it.
 container=""
-for wait in 2 4 8 16 30; do
+for wait in 2 4 8 16 30 0; do
   container=$(docker ps --all --quiet --filter "label=com.docker.compose.project=$project" \
     --filter label=com.docker.compose.service=updater | head -n 1)
   [ -z "$container" ] || break
@@ -182,7 +182,7 @@ fi
 # again while the request waits.
 request=""
 taken=false
-for wait in 2 4 8 16 30; do
+for wait in 2 4 8 16 30 0; do
   if request=$(updater host-request 2> /dev/null); then
     taken=true
     break
