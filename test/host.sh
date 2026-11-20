@@ -176,10 +176,12 @@ agent_revision() {
 }
 # publish_agent <n>: push a new backup agent image under its moving tag 0.1.
 # The server keeps the image it has under that tag; only the registry moves.
+# It replaces the updater image's healthcheck with one that passes (not
+# HEALTHCHECK NONE, which some Compose versions refuse in up --wait).
 publish_agent() {
   local before
   before=$(docker image inspect --format '{{.Id}}' "$agent:0.1" 2> /dev/null || true)
-  printf 'FROM %s\nLABEL test.revision=agent-%s\nHEALTHCHECK NONE\nENTRYPOINT ["sleep"]\nCMD ["3600"]\n' "$image" "$1" |
+  printf 'FROM %s\nLABEL test.revision=agent-%s\nHEALTHCHECK --interval=1s --timeout=2s --start-period=1s CMD true\nENTRYPOINT ["sleep"]\nCMD ["3600"]\n' "$image" "$1" |
     docker build --quiet --tag "$agent:0.1" - > /dev/null
   docker push --quiet "$agent:0.1" > /dev/null
   if [ -n "$before" ]; then docker tag "$before" "$agent:0.1"; fi
@@ -226,7 +228,7 @@ EOF
 printf '# The app of the host test\nCOMPOSE_PROJECT_NAME=%s\nAPP_TAG: 1.0.0\nOTHER=kept\n' "$pinned" > "$pinned_dir/.env"
 chmod 0640 "$pinned_dir/.env"
 cd "$pinned_dir"
-pinned_compose up --detach --wait --quiet-pull 2> /dev/null || fail "the pinned app did not start"
+pinned_compose up --detach --wait --quiet-pull > up.log 2>&1 || fail "the pinned app did not start: $(tail -n 5 up.log)"
 docker compose run --rm -T updater host-setup > updater-setup.sh
 # Another app on the server still runs updater 0.1 with its deploy script.
 as_root sh -c 'mkdir -p /usr/local/lib/meldgrove-updater && printf "#!/bin/sh\n# updater 0.1\n" > /usr/local/lib/meldgrove-updater/deploy'
