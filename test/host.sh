@@ -14,6 +14,7 @@ if [ -z "$image" ]; then
 fi
 registry=127.0.0.1:5557
 app=localhost:5557/app
+agent=localhost:5557/backup-agent
 project=updater-host-test
 unit=meldgrove-updater-$project
 dir=$(mktemp -d)
@@ -170,6 +171,19 @@ pinned_revision() {
   docker inspect --format '{{index .Config.Labels "test.revision"}}' "$(pinned_compose ps --all --quiet app)" 2> /dev/null
 }
 pinned_revision_is() { [ "$(pinned_revision)" = "$1" ]; }
+agent_revision() {
+  docker inspect --format '{{index .Config.Labels "test.revision"}}' "$(pinned_compose ps --all --quiet backup-agent)" 2> /dev/null
+}
+# publish_agent <n>: push a new backup agent image under its moving tag 0.1.
+# The server keeps the image it has under that tag; only the registry moves.
+publish_agent() {
+  local before
+  before=$(docker image inspect --format '{{.Id}}' "$agent:0.1" 2> /dev/null || true)
+  printf 'FROM %s\nLABEL test.revision=agent-%s\nHEALTHCHECK NONE\nENTRYPOINT ["sleep"]\nCMD ["3600"]\n' "$image" "$1" |
+    docker build --quiet --tag "$agent:0.1" - > /dev/null
+  docker push --quiet "$agent:0.1" > /dev/null
+  if [ -n "$before" ]; then docker tag "$before" "$agent:0.1"; fi
+}
 env_tag() { sed -n 's/^APP_TAG=//p' "$pinned_dir/.env"; }
 env_tag_is() { [ "$(env_tag)" = "$1" ]; }
 status() { pinned_compose exec -T updater updater status; }
@@ -177,6 +191,7 @@ status_has() { status 2> /dev/null | jq -e "$1" > /dev/null; }
 pinned_logged() { pinned_compose logs updater 2>&1 | grep "$1" > /dev/null; }
 
 version 1.0.0
+publish_agent 1
 cat > "$pinned_dir/compose.yaml" << EOF
 services:
   migrate:
@@ -201,6 +216,9 @@ services:
       LISTEN: 127.0.0.1:18092
     volumes:
       - updater:/trigger
+  backup-agent:
+    image: $agent:0.1
+    restart: unless-stopped
 volumes:
   updater:
 EOF
@@ -219,8 +237,12 @@ grep -q "writes each version it installs to APP_TAG" setup.log || fail "the setu
 eventually 20 status_has '.mode == "host" and .channelLocked == null and .installed == "1.0.0"' || fail "unexpected status: $(status)"
 pass "a host setup of protocol 2 lets the app choose versions"
 
+[ "$(agent_revision)" = agent-1 ] || fail "the backup agent runs $(agent_revision)"
+publish_agent 2
 version 1.0.1
 eventually 90 status_has '.last.version == "1.0.1" and .last.result == "installed"' || fail "1.0.1 did not install: $(status)"
+[ "$(agent_revision)" = agent-2 ] || fail "the backup agent still runs $(agent_revision) after the update"
+pass "an update pulls the backup agent's moved tag"
 env_tag_is 1.0.1 || fail ".env has APP_TAG=$(env_tag)"
 pinned_revision_is 1.0.1 || fail "the app runs $(pinned_revision)"
 if ! grep -qx "OTHER=kept" .env || ! grep -q "^# The app of the host test" .env; then
