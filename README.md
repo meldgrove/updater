@@ -125,7 +125,10 @@ touches the updater's volume: it takes the request and reports back with
 1. takes the version from the updater's request (it accepts nothing but a
    version number) and the image repository and `VERSION_VARIABLE` from the
    updater's own configuration;
-2. pulls the image, saves `.env` and writes the version to `VERSION_VARIABLE`;
+2. pulls the image (and the updater's, and the
+   [backup agent](https://github.com/meldgrove/backup-agent)'s when the app
+   has the `backup-agent` service), saves `.env` and writes the version to
+   `VERSION_VARIABLE`;
 3. runs `docker compose up --detach --wait`: migrations first, then the app,
    until every service is healthy (at most 15 minutes);
 4. when that fails, puts `.env` back and starts the version before, and

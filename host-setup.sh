@@ -170,6 +170,15 @@ set +f
 compose() {
   docker compose --ansi never --project-name "$project" --project-directory "$directory" "$@"
 }
+# pull_agent: pull the image of the Meldgrove Backup Agent, when the project
+# has one. Its tag moves (0.1), and docker compose up pulls only missing
+# images, so without this it would never update.
+pull_agent() {
+  if compose "$@" config --services 2> /dev/null | grep -x backup-agent > /dev/null; then
+    compose "$@" pull --quiet backup-agent > /dev/null 2>&1 ||
+      echo "Could not pull the backup agent's image; it keeps the one it has." >&2
+  fi
+}
 
 if [ "$mode" = updater ]; then
   # "$@" holds the --file and --env-file arguments.
@@ -205,6 +214,7 @@ if [ "$(field protocol)" != 2 ]; then
   echo "Installing the newest image of $image."
   docker pull --quiet "$image"
   docker pull --quiet "$updater_image" || echo "Could not pull the updater's image; it keeps the one it has." >&2
+  pull_agent "$@"
   compose "$@" up --detach --quiet-pull
   exit
 fi
@@ -294,6 +304,7 @@ if ! docker pull --quiet "$target" > "$log" 2>&1; then
   exit 1
 fi
 docker pull --quiet "$updater_image" > /dev/null 2>&1 || echo "Could not pull the updater's image; it keeps the one it has." >&2
+pull_agent "$@"
 
 # Every assignment of the variable gets the version; it is added when missing.
 cp "$env_file" "$state/env.before"
