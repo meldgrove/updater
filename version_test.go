@@ -122,6 +122,11 @@ func TestWindow(t *testing.T) {
 	if !overnight.Contains(at(23, 0)) || !overnight.Contains(at(1, 0)) || overnight.Contains(at(12, 0)) {
 		t.Error("22:00-02:00 contains the wrong times")
 	}
+	// Summer time skips 02:00-03:00 on 29 March; the next day opens on time.
+	early, _ := ParseWindow("02:30-03:00")
+	if got := early.NextOpen(time.Date(2026, 3, 29, 10, 0, 0, 0, berlin)); !got.Equal(time.Date(2026, 3, 30, 2, 30, 0, 0, berlin)) {
+		t.Errorf("NextOpen after the change to summer time = %v", got)
+	}
 }
 
 func TestReleaseNotes(t *testing.T) {

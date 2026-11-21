@@ -247,7 +247,8 @@ func (e *Engine) nextCheck() time.Duration {
 			wait = until + time.Second
 		}
 	}
-	if !e.wakeAt.IsZero() {
+	// While off, nothing clears a wake-up that has passed.
+	if !e.wakeAt.IsZero() && e.mode() != "off" {
 		if until := e.wakeAt.Sub(e.now()); until < wait {
 			wait = until + time.Second
 		}
@@ -520,7 +521,8 @@ func (e *Engine) readyAt(ctx context.Context, o *offer) time.Time {
 		seen = e.now()
 	}
 	e.mu.Unlock()
-	if o.version != nil && e.pinned() && (channel == "preview" || o.version.IsPreview()) {
+	// Previews also on a platform that follows the tag preview.
+	if o.version != nil && (o.version.IsPreview() || (e.pinned() && channel == "preview")) {
 		return seen
 	}
 	out := seen
@@ -584,7 +586,7 @@ func (e *Engine) checkTag(ctx context.Context) error {
 		if _, ok := e.state.Seen[latest]; !ok {
 			// A newer image starts the cooldown again.
 			e.state.Seen = map[string]int64{latest: e.now().Unix()}
-			if e.cfg.Cooldown == 0 {
+			if e.cfg.Cooldown == 0 || e.cfg.Tag == "preview" { // previews: no cooldown
 				e.logf("%s points to a new image: %s.", e.cfg.Image, latest)
 			} else {
 				e.logf("%s points to a new image: %s. It installs once it has been out for %s.", e.cfg.Image, latest, e.cfg.CooldownText)
@@ -851,7 +853,8 @@ func randomID() string {
 func (e *Engine) callHook(ctx context.Context) error {
 	request, err := http.NewRequestWithContext(ctx, http.MethodPost, e.cfg.HookURL, nil)
 	if err != nil {
-		return err
+		// The error names the link, which may hold a secret.
+		return errors.New("DEPLOY_HOOK_URL is not a valid link.")
 	}
 	if e.cfg.HookToken != "" {
 		request.Header.Set("Authorization", "Bearer "+e.cfg.HookToken)

@@ -461,6 +461,46 @@ func TestPlatformFollowsTheTag(t *testing.T) {
 	}
 }
 
+func TestPlatformInstallsPreviewsWithoutTheCooldown(t *testing.T) {
+	calls := 0
+	hook := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) { calls++ }))
+	defer hook.Close()
+	h := newHarness(t, map[string]string{"IMAGE": "REGISTRY/meldgrove/app:preview", "DEPLOY_HOOK_URL": hook.URL + "/deploy", "COOLDOWN": "3d"}, time.Time{})
+	h.registry.set("0.2.0", "0.2.1-preview.1", "0.2.1-preview.2")
+	h.registry.point("preview", "0.2.1-preview.1")
+	h.engine.start()
+	h.cycle()
+	h.registry.point("preview", "0.2.1-preview.2")
+	h.cycle()
+	if calls != 1 {
+		t.Fatalf("deployments = %d, available = %+v", calls, h.status().Available)
+	}
+	if h.logged("It installs once") {
+		t.Error("the log says the preview waits for the cooldown")
+	}
+}
+
+func TestAnInvalidDeployLinkStaysOutOfTheStatus(t *testing.T) {
+	h := newHarness(t, map[string]string{"IMAGE": "REGISTRY/meldgrove/app:latest", "DEPLOY_HOOK_URL": "https://deploy.example/hook/secret-key%zz"}, time.Time{})
+	h.registry.set("0.2.0", "0.2.1")
+	h.registry.point("latest", "0.2.0")
+	h.engine.start()
+	h.cycle()
+	h.registry.point("latest", "0.2.1")
+	h.cycle()
+	s := h.status()
+	if s.Last == nil || s.Last.Result != "failed" || s.Last.Message == nil {
+		t.Fatalf("last = %+v", s.Last)
+	}
+	state, err := os.ReadFile(filepath.Join(h.trigger, "state.json"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if strings.Contains(*s.Last.Message, "secret-key") || strings.Contains(string(state), "secret-key") || h.logged("secret-key") {
+		t.Errorf("the deploy link is shown: %q", *s.Last.Message)
+	}
+}
+
 func TestLegacyHostFollowsTheTag(t *testing.T) {
 	h := newHarness(t, map[string]string{"IMAGE": "REGISTRY/meldgrove/app:0.2"}, time.Time{})
 	h.registry.set("0.2.0", "0.2.1", "0.3.0")
@@ -519,6 +559,22 @@ func TestOffModeShowsUpdatesButInstallsNothing(t *testing.T) {
 	response := call(t, h.engine.Handler(context.Background()), "POST", "/v1/install", `{"version":"0.2.1"}`)
 	if response.Code != http.StatusServiceUnavailable && response.Code != http.StatusConflict {
 		t.Fatalf("install while off: %d", response.Code)
+	}
+}
+
+func TestOffModeDoesNotWakeForTheWindow(t *testing.T) {
+	h := newHarness(t, map[string]string{"WINDOW": "02:00-05:00"}, time.Date(2026, 11, 1, 0, 0, 0, 0, time.UTC))
+	h.registry.set("0.2.0", "0.2.1")
+	h.watch(2)
+	h.engine.start()
+	h.cycle() // 12:00: the update waits for the window
+	if err := os.Remove(filepath.Join(h.trigger, "watched")); err != nil {
+		t.Fatal(err)
+	}
+	h.clock = time.Date(2026, 11, 20, 3, 0, 0, 0, time.UTC)
+	h.cycle()
+	if wait := h.engine.nextCheck(); wait != time.Hour {
+		t.Errorf("next check while off in %v", wait)
 	}
 }
 

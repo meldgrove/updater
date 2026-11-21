@@ -74,7 +74,9 @@ func (w *Window) NextOpen(t time.Time) time.Time {
 	}
 	opens := time.Date(t.Year(), t.Month(), t.Day(), w.Opens/60, w.Opens%60, 0, 0, t.Location())
 	if !opens.After(t) {
-		opens = opens.AddDate(0, 0, 1)
+		// From the date, not from opens: on the day daylight saving time
+		// skips the opening, opens is an hour late.
+		opens = time.Date(t.Year(), t.Month(), t.Day()+1, w.Opens/60, w.Opens%60, 0, 0, t.Location())
 	}
 	return opens
 }
