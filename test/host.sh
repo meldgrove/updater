@@ -360,12 +360,14 @@ installed_again() { [ "$(journal_count "installed: 2.0.0")" -gt "$installs" ]; }
 # also for services with pull_policy: always.
 awk -v image="    image: $app:" 'index($0, image) == 1 { print; print "    pull_policy: always"; next } { print }' compose.yaml > compose.next
 mv compose.next compose.yaml
-since=$(date +%s)
+# Nanoseconds: the refused request above pulled the tag, maybe in this very
+# second, and docker events counts whole seconds otherwise.
+since=$(date +%s.%N)
 ask 0a1c 2.0.0 "$digest"
 eventually 120 installed_again || fail "a request with the image's digest did not install"
 journal_has "$pinned_unit.service" "$app:2.0.0 is $digest, the image whose signature the updater checked" || fail "the journal does not name the checked digest"
 [ "$(newest_dump)" != "$dump_before" ] || fail "no dump before the installation with a digest"
-pulls=$(docker events --since "$since" --until "$(date +%s)" --filter type=image --filter event=pull --format '{{.Actor.ID}}' | grep -cx "$app:2.0.0" || true)
+pulls=$(docker events --since "$since" --until "$(date +%s.%N)" --filter type=image --filter event=pull --format '{{.Actor.ID}}' | grep -cx "$app:2.0.0" || true)
 [ "$pulls" = 1 ] || fail "the tag $app:2.0.0 was pulled $pulls times during the installation, not once"
 sed -i '/^    pull_policy: always$/d' compose.yaml
 pass "a request with the pulled image's digest installs that image, without pulling the tag again; one without a digest installs as before (above)"
