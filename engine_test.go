@@ -283,10 +283,17 @@ func TestHostResultsAndRollback(t *testing.T) {
 	}
 	// The server takes the request and reports its stages.
 	os.Remove(filepath.Join(h.trigger, "deploy"))
-	h.report("progress", "id="+id, "stage=starting")
+	for _, stage := range []string{"pulling", "backing-up", "starting"} {
+		h.report("progress", "id="+id, "stage="+stage)
+		h.engine.pollHost()
+		if s := h.status(); s.Installing == nil || s.Installing.Stage != stage {
+			t.Fatalf("installing = %+v, want the stage %s", s.Installing, stage)
+		}
+	}
+	h.report("progress", "id="+id, "stage=dancing")
 	h.engine.pollHost()
 	if s := h.status(); s.Installing == nil || s.Installing.Stage != "starting" {
-		t.Fatalf("installing = %+v", s.Installing)
+		t.Fatalf("an unknown stage was taken: %+v", s.Installing)
 	}
 	h.report("result", "id="+id, "version=0.2.1", "result=rolled-back", `message=container app-web-1 is unhealthy`, "finished=1795000000")
 	h.engine.pollHost()
@@ -623,10 +630,13 @@ func TestAPIValidates(t *testing.T) {
 	}
 	var s map[string]any
 	json.Unmarshal(call(t, handler, "GET", "/v1/status", "").Body.Bytes(), &s)
-	for _, key := range []string{"updater", "mode", "channel", "channelLocked", "installed", "available", "attention", "installing", "last", "checking", "checkedAt", "error", "automatic", "cooldown", "window", "timezone"} {
+	for _, key := range []string{"updater", "mode", "channel", "channelLocked", "installed", "available", "attention", "installing", "last", "checking", "checkedAt", "error", "automatic", "cooldown", "window", "timezone", "apiToken"} {
 		if _, ok := s[key]; !ok {
 			t.Errorf("status has no %s", key)
 		}
+	}
+	if s["apiToken"] != false {
+		t.Errorf("apiToken = %v without API_TOKEN, want false", s["apiToken"])
 	}
 }
 
@@ -677,6 +687,9 @@ func TestAPITokenGuardsEveryRequestButTheHealthCheck(t *testing.T) {
 	// A refused request changes nothing.
 	if s := h.status(); s.Channel != "stable" || s.Installing != nil {
 		t.Errorf("a refused request changed the status: %+v", s)
+	}
+	if s := h.status(); !s.APIToken {
+		t.Error("apiToken is false although API_TOKEN is set")
 	}
 }
 

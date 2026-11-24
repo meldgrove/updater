@@ -11,10 +11,13 @@
 #
 # It installs a systemd path unit that waits for the updater's request in the
 # volume at /trigger, and a service that then installs the version the
-# updater asks for: it writes it to the version variable in .env, pulls the
-# image, runs docker compose up --wait, and goes back to the version before
-# when the app does not become healthy. The updater keeps running without
-# access to Docker. Running the setup again updates the deploy script.
+# updater asks for: it pulls the image, dumps the database with the app's
+# backup agent (the two newest dumps stay in
+# /var/backups/meldgrove-updater/<project>), writes the version to the
+# version variable in .env, runs docker compose up --wait, and goes back to
+# the version before when the app does not become healthy. The updater
+# keeps running without access to Docker. Running the setup again updates
+# the deploy script.
 set -eu
 
 fail() {
@@ -85,6 +88,8 @@ if [ "$action" = remove ]; then
     rmdir /var/lib/meldgrove-updater 2> /dev/null || true
   fi
   echo "Automatic updates of $project are off."
+  [ ! -d "/var/backups/meldgrove-updater/$project" ] ||
+    echo "The database dumps before updates stay in /var/backups/meldgrove-updater/$project."
   exit 0
 fi
 
@@ -103,10 +108,18 @@ cat > "$deploy.new" << 'EOF'
 #                              the tag)
 #   deploy <project> updater   recreate only the updater container
 #
-# A version is installed by writing it to the variable VERSION_VARIABLE (from
-# the updater's environment) in the env file, pulling the image, and docker
-# compose up --wait. When that fails, the env file goes back to what it was
-# and the version before starts again.
+# A version is installed by pulling the image, dumping the database, writing
+# the version to the variable VERSION_VARIABLE (from the updater's
+# environment) in the env file, and docker compose up --wait. When that
+# fails, the env file goes back to what it was and the version before starts
+# again; the database stays as the new version left it, and the message
+# names the dump.
+#
+# The dump: when the project has a backup-agent service (the Meldgrove
+# Backup Agent) and no env file sets UPDATE_BACKUP=off, the agent's image
+# writes pg_dump of the app's database to
+# /var/backups/meldgrove-updater/<project>/<project>-<version before>-<UTC time>.dump
+# (root only); the two newest stay. When it fails, nothing is installed.
 #
 # The volume belongs to the unprivileged updater, so this script, which runs
 # as root, never reads or writes it: it takes the request and reports the
@@ -170,11 +183,18 @@ set +f
 compose() {
   docker compose --ansi never --project-name "$project" --project-directory "$directory" "$@"
 }
-# pull_agent: pull the image of the Meldgrove Backup Agent, when the project
-# has one. Its tag moves (0.1), and docker compose up pulls only missing
-# images, so without this it would never update.
+# has_agent: whether the project has the Meldgrove Backup Agent.
+# Without interpolation as well, so that a setting the env file lacks hides
+# no service.
+has_agent() {
+  { compose "$@" config --services 2> /dev/null || compose "$@" config --no-interpolate --services 2> /dev/null; } |
+    grep -x backup-agent > /dev/null
+}
+# pull_agent: pull the backup agent's image, when the project has one. Its
+# tag moves (0.1), and docker compose up pulls only missing images, so
+# without this it would never update.
 pull_agent() {
-  if compose "$@" config --services 2> /dev/null | grep -x backup-agent > /dev/null; then
+  if has_agent "$@"; then
     compose "$@" pull --quiet backup-agent > /dev/null 2>&1 ||
       echo "Could not pull the backup agent's image; it keeps the one it has." >&2
   fi
@@ -224,10 +244,17 @@ version=$(field version)
 case $id in '' | *[!0-9a-f]*) echo "The request has no valid id." >&2 && exit 1 ;; esac
 
 progress() { updater host-report progress "$id" "$1" > /dev/null 2>&1 || true; }
+# The database dump of this installation, once written.
+dump=""
 # finish <result> <message>: the outcome for the updater, also in the journal.
+# A failure names the dump first, so that the cut to 400 characters keeps it.
 # Tried a few times: the updater container may still be starting.
 finish() {
-  message=$(printf '%s' "$2" | tr '\r\n\t' '   ' | tr -cd '[:print:]' | cut -c 1-400)
+  text=$2
+  if [ "$1" != installed ] && [ -n "$dump" ]; then
+    text="Database before the update: $dump. $text"
+  fi
+  message=$(printf '%s' "$text" | tr '\r\n\t' '   ' | tr -cd '[:print:]' | cut -c 1-400)
   echo "$1: $version${message:+ ($message)}"
   for _ in 1 2 3 4 5 6; do
     if updater host-report result "$id" "$version" "$1" "$message" > /dev/null 2>&1; then
@@ -278,6 +305,27 @@ if [ ! -f "$env_file" ]; then
   exit 1
 fi
 env_file=$(readlink -f "$env_file")
+# env_value <name>: the value of the last assignment of <name> in the env
+# files (the last file that sets it wins, as for the version variable), as
+# Compose reads it: a quoted value up to its closing quote, otherwise
+# without a comment and spaces at the end.
+env_value() {
+  line=""
+  while IFS= read -r candidate; do
+    [ -f "$candidate" ] || continue
+    found=$(grep -E "^[[:space:]]*(export[[:space:]]+)?$1[[:space:]]*[=:]" "$candidate" | tail -n 1)
+    [ -z "$found" ] || line=$found
+  done << LIST
+${env_list:-$directory/.env}
+LIST
+  value=$(printf '%s\n' "$line" | sed -E 's/^[^=:]*[=:][[:space:]]*//')
+  case $value in
+    \"*) value=${value#\"}; value=${value%%\"*} ;;
+    \'*) value=${value#\'}; value=${value%%\'*} ;;
+    *) value=$(printf '%s\n' "$value" | sed -E 's/[[:space:]]+#.*//; s/[[:space:]]*$//') ;;
+  esac
+  printf '%s\n' "$value"
+}
 
 mkdir -p "$state"
 chmod 0700 "$state"
@@ -305,6 +353,62 @@ if ! docker pull --quiet "$target" > "$log" 2>&1; then
 fi
 docker pull --quiet "$updater_image" > /dev/null 2>&1 || echo "Could not pull the updater's image; it keeps the one it has." >&2
 pull_agent "$@"
+
+# The database before the update, dumped by the backup agent's image just
+# pulled (or, when that pull failed, the one the server has). Nothing has
+# changed yet: when the dump fails, the installation stops here.
+backups=/var/backups/meldgrove-updater/$project
+if [ "$(env_value UPDATE_BACKUP | tr '[:upper:]' '[:lower:]')" = off ]; then
+  echo "UPDATE_BACKUP=off: no database backup before the update."
+elif ! services=$(compose "$@" config --services 2> "$log") &&
+  ! services=$(compose "$@" config --no-interpolate --services 2> /dev/null); then
+  # Without the list, a missing backup-agent service and a missing setting
+  # look the same: never skip the dump on a guess.
+  cat "$log" >&2
+  finish failed "Docker Compose cannot list the services, so the server cannot tell whether to back up the database: $(last_error "$log" | cut -c 1-200). To install without a backup, set UPDATE_BACKUP=off in .env."
+  exit 1
+elif ! printf '%s\n' "$services" | grep -x backup-agent > /dev/null; then
+  echo "The project has no backup-agent service: no database backup before the update."
+else
+  progress backing-up
+  # The version that runs now names the dump; for a tag such as 0.3, the
+  # version label of the image a running container of the app was made from.
+  label=$before
+  if ! printf '%s\n' "$label" | grep -Eqx '[0-9]+\.[0-9]+\.[0-9]+(-preview\.[0-9]+)?'; then
+    exact=$(docker ps --quiet --filter "label=com.docker.compose.project=$project" | while read -r running_container; do
+      docker inspect --format '{{.Config.Image}} {{index .Config.Labels "org.opencontainers.image.version"}}' "$running_container"
+    done | awk -v image="$name" '$1 == image { print $2; exit }')
+    if printf '%s\n' "$exact" | grep -Eqx '[0-9]+\.[0-9]+\.[0-9]+(-preview\.[0-9]+)?'; then label=$exact; fi
+  fi
+  case $label in '' | *[!A-Za-z0-9._-]*) label=unknown ;; esac
+  next=$backups/$project-$label-$(date -u +%Y%m%dT%H%M%SZ).dump
+  echo "Backing up the database to $next."
+  # Every error of these steps goes to the log, which names the reason.
+  if {
+    mkdir -p "$backups" && chmod 0700 /var/backups/meldgrove-updater "$backups" && rm -f "$backups"/*.partial &&
+      (umask 077 && compose "$@" run --rm --no-deps -T backup-agent dump-database < /dev/null > "$next.partial") &&
+      mv -f "$next.partial" "$next"
+  } 2> "$log"; then
+    dump=$next
+    echo "Database before the update: $dump ($(du -h "$dump" | cut -f 1))."
+    # Keep the two newest dumps; their names end in the time.
+    for file in "$backups/$project"-*-????????T??????Z.dump; do
+      printf '%s %s\n' "${file##*-}" "$file"
+    done | sort -r | tail -n +3 | while read -r _ file; do
+      rm -f "$file" || echo "Could not delete the old dump $file." >&2
+    done
+  else
+    rm -f "$next.partial" 2> /dev/null || true
+    cat "$log" >&2
+    if grep -q '^Usage: backup-agent' "$log"; then
+      reason="the backup agent's image is too old: it has no dump-database command"
+    else
+      reason=$(grep -v '^[[:space:]]*$' "$log" | tail -n 1 | cut -c 1-200 | sed 's/[.[:space:]]*$//')
+    fi
+    finish failed "The database backup before the update failed: ${reason:-no reason given}. ${before:-The version before} keeps running. To install without it, set UPDATE_BACKUP=off in .env."
+    exit 1
+  fi
+fi
 
 # Every assignment of the variable gets the version; it is added when missing.
 cp "$env_file" "$state/env.before"
@@ -417,4 +521,9 @@ if [ -z "$variable" ]; then
   echo "- compose.yaml sets no VERSION_VARIABLE: the updater follows the image tag, and the app cannot choose the channel."
 else
   echo "- The server writes each version it installs to $variable in .env."
+  if docker compose config --services 2> /dev/null | grep -x backup-agent > /dev/null; then
+    echo "- Before each installation, the server dumps the database to /var/backups/meldgrove-updater/$project and keeps the two newest dumps. UPDATE_BACKUP=off in .env switches this off."
+  else
+    echo "- compose.yaml has no backup-agent service, so the server dumps no database before an installation."
+  fi
 fi

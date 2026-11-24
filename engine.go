@@ -920,7 +920,7 @@ func (e *Engine) pollHost() {
 	}
 	if progress, ok := readFields(e.path("progress")); ok && progress["id"] == install.ID {
 		switch stage := progress["stage"]; stage {
-		case "pulling", "starting", "rolling-back":
+		case "pulling", "backing-up", "starting", "rolling-back":
 			if install.Stage != stage {
 				install.Stage = stage
 				e.save()

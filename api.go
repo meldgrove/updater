@@ -30,6 +30,8 @@ type Status struct {
 	Cooldown      *string     `json:"cooldown"`
 	Window        *string     `json:"window"`
 	Timezone      string      `json:"timezone"`
+	// APIToken is true when API_TOKEN is set, so the API requires it.
+	APIToken bool `json:"apiToken"`
 }
 
 type Installing struct {
@@ -94,6 +96,7 @@ func (e *Engine) Status() Status {
 		Automatic:     mode != "off",
 		Window:        nil,
 		Timezone:      e.cfg.TimeZone,
+		APIToken:      e.cfg.APIToken != "",
 	}
 	if locked != "" {
 		s.Channel = "stable"
