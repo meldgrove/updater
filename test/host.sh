@@ -356,11 +356,19 @@ pass "a request whose digest the pulled image does not have fails before the dum
 digest=$(registry_digest 2.0.0)
 installs=$(journal_count "installed: 2.0.0")
 installed_again() { [ "$(journal_count "installed: 2.0.0")" -gt "$installs" ]; }
+# Docker Compose must start the checked image, without pulling the tag again,
+# also for services with pull_policy: always.
+awk -v image="    image: $app:" 'index($0, image) == 1 { print; print "    pull_policy: always"; next } { print }' compose.yaml > compose.next
+mv compose.next compose.yaml
+since=$(date +%s)
 ask 0a1c 2.0.0 "$digest"
 eventually 120 installed_again || fail "a request with the image's digest did not install"
 journal_has "$pinned_unit.service" "$app:2.0.0 is $digest, the image whose signature the updater checked" || fail "the journal does not name the checked digest"
 [ "$(newest_dump)" != "$dump_before" ] || fail "no dump before the installation with a digest"
-pass "a request with the pulled image's digest installs; one without a digest installs as before (above)"
+pulls=$(docker events --since "$since" --until "$(date +%s)" --filter type=image --filter event=pull --format '{{.Actor.ID}}' | grep -cx "$app:2.0.0" || true)
+[ "$pulls" = 1 ] || fail "the tag $app:2.0.0 was pulled $pulls times during the installation, not once"
+sed -i '/^    pull_policy: always$/d' compose.yaml
+pass "a request with the pulled image's digest installs that image, without pulling the tag again; one without a digest installs as before (above)"
 
 printf 'TEST_DUMP=fail\n' >> .env
 version 2.0.1

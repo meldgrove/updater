@@ -350,8 +350,17 @@ replace_env() {
   rm -f "$next"
   return 1
 }
-# restart <log>: what docker compose up says, and whether it succeeded.
-restart() { compose "$@" up --detach --wait --wait-timeout 900 --quiet-pull > "$log" 2>&1; }
+# restart <log>: what docker compose up says, and whether it succeeded. With
+# a checked digest, Compose starts the image just checked and pulls no tag
+# again, also for a service with pull_policy: always (where Compose knows
+# up --pull).
+restart() {
+  if [ -n "$digest" ] && compose up --help 2> /dev/null | grep -q -- '--pull'; then
+    compose "$@" up --detach --wait --wait-timeout 900 --quiet-pull --pull missing > "$log" 2>&1
+  else
+    compose "$@" up --detach --wait --wait-timeout 900 --quiet-pull > "$log" 2>&1
+  fi
+}
 
 echo "Installing $target."
 progress pulling

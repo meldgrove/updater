@@ -44,7 +44,6 @@ type Engine struct {
 
 	signatures *Signatures
 	signature  string             // required, not-signed, or "" while not known (Status)
-	decided    map[string]string  // installed version or digest: the repository that signs it, "" for none
 	verdicts   map[string]verdict // digest and repository: a verified or invalid signature
 }
 
@@ -86,7 +85,6 @@ func NewEngine(cfg Config, logf func(string, ...any)) *Engine {
 		infos:      map[string]ImageInfo{},
 		logged:     map[string]time.Time{},
 		signatures: NewSignatures(cfg.Trigger, cfg.Version),
-		decided:    map[string]string{},
 		verdicts:   map[string]verdict{},
 	}
 }
@@ -310,7 +308,7 @@ func (e *Engine) check(ctx context.Context) {
 		err = e.checkTag(ctx)
 	}
 	if err == nil {
-		e.updateSignature(ctx)
+		err = e.updateSignature(ctx)
 	}
 	e.mu.Lock()
 	defer e.mu.Unlock()

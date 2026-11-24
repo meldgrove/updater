@@ -310,7 +310,9 @@ the TUF repository does not answer, the cache serves while it is valid
 **On a server,** the request names the digest whose signature was checked
 (`digest=sha256:…`), and the deploy script installs only that image: when
 the pulled image is another one, the installation fails with "its tag moved
-after the check" before it dumps the database or changes `.env`. Servers
+after the check" before it dumps the database or changes `.env`; Docker
+Compose then starts the image it checked without pulling the tag again, also
+for a service with `pull_policy: always`. Servers
 get this when their host setup is written again from updater 0.2.5 or later
 (as root in the app's folder):
 

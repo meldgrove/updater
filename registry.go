@@ -400,7 +400,9 @@ func (r *Registry) referrers(ctx context.Context, digest string) ([]descriptor, 
 		return index.Manifests, nil
 	}
 	drain(response)
-	if response.StatusCode != http.StatusNotFound {
+	// A registry without the API answers 404 (OCI), some 400 or 405.
+	if response.StatusCode >= 500 || response.StatusCode == http.StatusTooManyRequests ||
+		response.StatusCode == http.StatusUnauthorized || response.StatusCode == http.StatusForbidden {
 		return nil, r.describe(r.host+"/"+r.repository+"@"+digest, response, nil)
 	}
 	tag := strings.Replace(digest, ":", "-", 1)

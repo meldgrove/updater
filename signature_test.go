@@ -311,13 +311,71 @@ func TestATrustedRootThatCannotBeReadInstallsNothing(t *testing.T) {
 	h.engine.start()
 	h.cycle()
 	s := h.status()
-	if h.request() != nil || s.Signature != nil || s.Error == nil || !strings.Contains(*s.Error, "cannot tell whether it must be signed") {
+	if h.request() != nil || s.Signature != nil || s.Error == nil || !strings.HasPrefix(*s.Error, "Cannot tell whether updates must be signed: Sigstore's trusted root cannot be read") {
 		t.Fatalf("request %v, signature %v, error %v", h.request(), s.Signature, s.Error)
 	}
+	if wait := h.engine.nextCheck(); wait > time.Minute {
+		t.Errorf("next check in %s", wait)
+	}
+	// The operator's way out works while the check cannot run.
+	go h.engine.serveRequests(t)
+	if code := allowUnsigned(h.trigger, "0.2.1"); code != 0 {
+		t.Fatal(code)
+	}
+	if response := call(t, h.engine.Handler(context.Background()), "POST", "/v1/install", `{"version":"0.2.1"}`); response.Code != http.StatusAccepted {
+		t.Fatalf("install: %d %s", response.Code, response.Body)
+	}
+	if request := h.request(); request["version"] != "0.2.1" || request["digest"] != "" {
+		t.Fatalf("request = %v", request)
+	}
+}
+
+func TestTheTrustedRootIsReadAgain(t *testing.T) {
+	h := signedHarness(t, nil, "0.2.0", "0.2.1")
+	h.engine.signatures.load = func() (root.TrustedMaterial, error) {
+		return nil, errors.New("tuf-repo-cdn.sigstore.dev does not answer")
+	}
+	h.watch(2)
+	h.engine.start()
+	h.cycle()
 	h.engine.signatures.load = recordedRoot(t)
 	h.cycle()
 	if request := h.request(); request["digest"] != handbookDigest(t, "0.2.1") {
 		t.Fatalf("request = %v", request)
+	}
+}
+
+// An installed image whose attestation came after the updater first looked
+// (it starts while a release is being published) requires signatures from
+// then on.
+func TestAnInstalledImageIsAskedAgain(t *testing.T) {
+	h := signedHarness(t, nil)
+	digest := h.registry.record("0.2.0", fixture(t, "handbook-0.2.0.index.json"))
+	h.watch(2)
+	h.engine.start()
+	h.cycle()
+	if s := h.status(); s.Signature == nil || *s.Signature != "not-signed" {
+		t.Fatalf("signature = %v", s.Signature)
+	}
+	h.registry.attach(digest, fixture(t, "handbook-0.2.0.bundle.json"))
+	h.registry.set("0.2.1") // unsigned
+	h.cycle()
+	if s := h.status(); h.request() != nil || s.Signature == nil || *s.Signature != "required" {
+		t.Fatalf("request %v, signature %v", h.request(), s.Signature)
+	}
+}
+
+// On a server whose IMAGE follows a series tag (before the first
+// installation pins a version), the decision reads the image of that tag.
+func TestAFloatingTagOnAServer(t *testing.T) {
+	h := signedHarness(t, map[string]string{"IMAGE": "REGISTRY/meldgrove/app:0.2"}, "0.2.1")
+	h.registry.record("0.2", fixture(t, "handbook-0.2.0.index.json"))
+	h.registry.attach(handbookDigest(t, "0.2.0"), fixture(t, "handbook-0.2.0.bundle.json"))
+	h.watch(2)
+	h.engine.start()
+	h.cycle()
+	if request := h.request(); request["version"] != "0.2.1" || request["digest"] != handbookDigest(t, "0.2.1") {
+		t.Fatalf("request = %v, status %+v", request, h.status())
 	}
 }
 
