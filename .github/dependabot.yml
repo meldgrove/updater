@@ -23,3 +23,18 @@ updates:
     groups:
       github-actions:
         patterns: ["*"]
+
+  # sigstore-go and its modules (the signature check). A new Sigstore bundle
+  # format needs a newer library, so these must not fall behind.
+  - package-ecosystem: gomod
+    directory: /
+    schedule:
+      interval: weekly
+    cooldown:
+      default-days: 7
+    commit-message:
+      prefix: chore
+      include: scope
+    groups:
+      go-modules:
+        patterns: ["*"]
