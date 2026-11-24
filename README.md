@@ -127,14 +127,15 @@ touches the updater's volume: it takes the request and reports back with
    updater's own configuration;
 2. pulls the image (and the updater's, and the
    [backup agent](https://github.com/meldgrove/backup-agent)'s when the app
-   has the `backup-agent` service), saves `.env` and writes the version to
-   `VERSION_VARIABLE`;
-3. runs `docker compose up --detach --wait`: migrations first, then the app,
+   has the `backup-agent` service);
+3. dumps the database ([Before each installation](#before-each-installation));
+4. saves `.env` and writes the version to `VERSION_VARIABLE`;
+5. runs `docker compose up --detach --wait`: migrations first, then the app,
    until every service is healthy (at most 15 minutes);
-4. when that fails, puts `.env` back and starts the version before, and
+6. when that fails, puts `.env` back and starts the version before, and
    reports why to the updater, which shows it in the app and does not try
    that version again on its own;
-5. removes older images of the app, keeping the new version and the one
+7. removes older images of the app, keeping the new version and the one
    before.
 
 - Each installation: `journalctl -u meldgrove-updater-<project>.service`.
@@ -145,6 +146,58 @@ touches the updater's volume: it takes the request and reports back with
 - Run the setup again after an updater release that changes it; it replaces
   the deploy script.
 - Switch it off: `sh updater-setup.sh remove`.
+
+#### Before each installation
+
+Before it changes anything, the deploy script dumps the app's database with
+the image of the [backup agent](https://github.com/meldgrove/backup-agent) it
+has just pulled (`backup-agent dump-database`), when the app has the
+`backup-agent` service. When that pull fails, the image on the server dumps. Only servers do this; on a platform such as Coolify,
+the platform deploys.
+
+- The dump is
+  `/var/backups/meldgrove-updater/<project>/<project>-<version before>-<UTC time>.dump`,
+  readable only by root. The two newest stay; older ones are deleted.
+- When the dump fails, or Docker Compose cannot list the app's services,
+  nothing is installed: the version before keeps running, and the app says
+  why.
+- When the installation fails or goes back to the version before, the
+  message in the app starts with the dump's path. Going back restores
+  `.env` and the images, not the database: migrations that ran stay. The
+  journal names each dump.
+- `UPDATE_BACKUP=off` in `.env` installs without a dump. Apps without the
+  `backup-agent` service install without one too.
+- Host setups written by updater 0.2.3 or older take no dump. To get it,
+  write and run the setup again, as root in the app's folder:
+
+  ```sh
+  docker compose run --rm -T --pull always updater host-setup > updater-setup.sh
+  sh updater-setup.sh
+  ```
+
+To restore a dump, as root in the app's folder:
+
+1. Stop the app's services, but not its database, such as
+   `docker compose stop web worker`.
+2. Restore the dump with the agent image's `pg_restore` and `psql`:
+
+   ```sh
+   docker compose run --rm -T --no-deps --entrypoint sh backup-agent -c '
+     pg_restore --clean --if-exists --no-owner --file=/tmp/restore.sql &&
+     psql --dbname="$DATABASE_URL" --single-transaction --set=ON_ERROR_STOP=1 --quiet --output=/dev/null \
+       --command="SET client_min_messages = warning; DROP SCHEMA public CASCADE;
+         CREATE SCHEMA public AUTHORIZATION pg_database_owner; GRANT USAGE ON SCHEMA public TO PUBLIC;" \
+       --file=/tmp/restore.sql' < /var/backups/meldgrove-updater/<project>/<dump>
+   ```
+
+   It empties the schema `public`, so tables that the newer version added
+   go as well, then restores the dump; all in one transaction. When anything
+   fails, the database stays as it was. It needs PostgreSQL 15 or newer and
+   a `DATABASE_URL` whose user owns the database.
+3. Start the version that wrote the dump, the one in its name:
+   `docker compose up -d`. After a rollback, `.env` names it already;
+   otherwise set the version variable in `.env` back to it first, or the
+   newer version migrates the database again.
 
 **From updater 0.1:** a host setup of 0.1 keeps working (the updater follows
 the image tag), and the app says that the channel needs the new setup. To get
@@ -175,6 +228,44 @@ its deployments pull the images again. Set `DEPLOY_HOOK_TOKEN` only when it
 expects `Authorization: Bearer <token>`, and use an `https://` link: the
 updater does not follow redirects, and the token travels with every call.
 
+## Managing updates yourself
+
+Without a host setup and without a deploy link, the updater's mode is `off`:
+nothing installs, and the app still shows new releases to its admins.
+
+- Pin an exact version in `.env`, such as `HELPDESK_VERSION=0.3.1`, so that
+  nothing changes until you change it.
+- To update by hand: read the release notes and dump the database; go on
+  only when the dump succeeds. Then set the new version in `.env` and run
+  `docker compose up -d --pull always`.
+
+  ```sh
+  (umask 077 && rm -f before.dump && docker compose run --rm -T --no-deps backup-agent dump-database > before.dump)
+  ```
+- A tool such as Renovate or Dependabot in your own infrastructure
+  repository can propose each new version as a pull request.
+- Read the release notes before a new series (0.3 → 0.4, 1 → 2): it needs
+  upgrade steps.
+
+## Your own build
+
+A fork that publishes its own images can use the updater unchanged:
+
+- `IMAGE` points at its registry, such as `ghcr.io/example/app:${APP_VERSION}`
+  (HTTPS; plain HTTP only on `localhost`). `REGISTRY_USERNAME` and
+  `REGISTRY_PASSWORD` sign in to a private registry.
+- Versions are image tags `X.Y.Z`, and `X.Y.Z-preview.N` for previews. Other
+  tags are no versions; `IMAGE` may follow one, such as `0.3` or `latest`.
+- The image's OCI annotations (on the image index, or as labels of the
+  image) describe a version: `org.opencontainers.image.version` (the version
+  behind a tag such as `0.3` or `latest`), `.revision` (the commit),
+  `.created` (the date the app shows, unless a GitHub Release has one) and
+  `.source` (the repository).
+- When `.source` is a GitHub repository, the release notes are its GitHub
+  Release `vX.Y.Z`, and a preview lists the changes since the installed
+  version. `SOURCE` names another repository; `GITHUB_TOKEN` reads a private
+  one.
+
 ## The app's update button
 
 Apps reach the updater at `http://updater:8080` on the Compose network. With
@@ -184,7 +275,9 @@ token. Without `API_TOKEN`, the API takes requests from anything that
 reaches it, and the updater says so in its log. Never publish its port. Only
 the app's admins see the update button, and the app checks that before it
 calls the API. The commands `updater status`, `install` and `channel` in the
-container send the token themselves.
+container send the token themselves. `apiToken` in the Status says whether
+the API requires the token, so the app can warn its admins while it does
+not.
 
 | Request | Answer |
 | --- | --- |
@@ -206,7 +299,7 @@ type Status = {
   available: Update | null;               // the update this installation gets
   attention: Update | null;               // Stable: a new series, needs upgrade steps
   installing: { version: string; startedAt: string; manual: boolean;
-                stage: "requested" | "pulling" | "starting" | "rolling-back" | "deploying" } | null;
+                stage: "requested" | "pulling" | "backing-up" | "starting" | "rolling-back" | "deploying" } | null;
   last: { version: string; result: "installed" | "failed" | "rolled-back" | "accepted";
           message: string | null; finishedAt: string } | null;
   checking: boolean;
@@ -216,6 +309,7 @@ type Status = {
   cooldown: string | null;                // COOLDOWN of Stable releases, e.g. "3d"
   window: string | null;                  // e.g. "02:00-05:00"
   timezone: string;
+  apiToken: boolean;                      // API_TOKEN is set: the API requires it
 };
 
 type Update = {
@@ -257,7 +351,8 @@ Asking the host to install 0.2.4.
 - **Backups:** an unattended update runs database migrations without anyone
   watching. Schedule backups first, as the app's deployment docs describe.
   Going back to the version before after a failed start does not undo
-  migrations that succeeded.
+  migrations that succeeded; on a server, the dump taken before the
+  installation does ([Before each installation](#before-each-installation)).
 - **Cooldown:** security fixes wait as well; install them from the app at
   once. An installation without cooldown runs each release first.
 - **Window:** the app is unavailable while it restarts. A window such as

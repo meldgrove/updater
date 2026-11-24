@@ -22,6 +22,8 @@ dir=$(mktemp -d)
 pinned=updater-host-pinned
 pinned_unit=meldgrove-updater-$pinned
 pinned_dir=$(mktemp -d)
+# The database dumps of the pinned app before each installation.
+backups=/var/backups/meldgrove-updater/$pinned
 
 as_root() {
   if [ "$(id -u)" = 0 ]; then "$@"; else sudo "$@"; fi
@@ -31,8 +33,10 @@ cleanup() {
   (cd "$dir" && as_root sh updater-setup.sh remove > /dev/null 2>&1) || true
   compose down --volumes --timeout 0 > /dev/null 2>&1 || true
   (cd "$pinned_dir" && as_root sh updater-setup.sh remove > /dev/null 2>&1) || true
-  docker compose --project-directory "$pinned_dir" down --volumes --timeout 0 > /dev/null 2>&1 || true
+  docker compose --project-directory "$pinned_dir" down --volumes --remove-orphans --timeout 0 > /dev/null 2>&1 || true
   rm -rf "$pinned_dir"
+  as_root rm -rf "$backups"
+  as_root rmdir /var/backups/meldgrove-updater 2> /dev/null || true
   docker rm --force updater-host-test-registry > /dev/null 2>&1 || true
   rm -rf "$dir"
 }
@@ -178,11 +182,18 @@ agent_revision() {
 # The server keeps the image it has under that tag; only the registry moves.
 # It replaces the updater image's healthcheck with one that passes (not
 # HEALTHCHECK NONE, which some Compose versions refuse in up --wait).
+# dump-database writes a fake dump that names the agent and the app's image;
+# with DUMP=fail it fails as pg_dump does.
 publish_agent() {
   local before
   before=$(docker image inspect --format '{{.Id}}' "$agent:0.1" 2> /dev/null || true)
-  printf 'FROM %s\nLABEL test.revision=agent-%s\nHEALTHCHECK --interval=1s --timeout=2s --start-period=1s CMD true\nENTRYPOINT ["sleep"]\nCMD ["3600"]\n' "$image" "$1" |
-    docker build --quiet --tag "$agent:0.1" - > /dev/null
+  docker build --quiet --tag "$agent:0.1" - > /dev/null << EOF
+FROM $image
+LABEL test.revision=agent-$1
+HEALTHCHECK --interval=1s --timeout=2s --start-period=1s CMD true
+ENTRYPOINT ["sh", "-c", "if [ \"\$0\" != dump-database ]; then exec sleep 3600; fi; if [ \"\$DUMP\" = fail ]; then echo 'pg_dump failed: connection to server failed.' >&2; exit 1; fi; echo \"PGDMP fake dump by agent-$1 of \$APP_IMAGE\""]
+CMD ["agent"]
+EOF
   docker push --quiet "$agent:0.1" > /dev/null
   if [ -n "$before" ]; then docker tag "$before" "$agent:0.1"; fi
 }
@@ -221,6 +232,9 @@ services:
   backup-agent:
     image: $agent:0.1
     restart: unless-stopped
+    environment:
+      APP_IMAGE: $app:\${APP_TAG:?}
+      DUMP: \${TEST_DUMP:-ok}
 volumes:
   updater:
 EOF
@@ -253,6 +267,17 @@ fi
 [ "$(stat -c %a .env)" = 640 ] || fail ".env changed its mode to $(stat -c %a .env)"
 pass "a release installs: pinned in .env, migrated, started, healthy, reported"
 
+# dump_count: the number of dumps the server keeps.
+dump_count() { as_root find "$backups" -name '*.dump' | wc -l; }
+first_dump=$(as_root find "$backups" -name "$pinned-1.0.0-*T*Z.dump")
+[ -n "$first_dump" ] || fail "no dump of 1.0.0: $(as_root ls -la "$backups")"
+[ "$(as_root cat "$first_dump")" = "PGDMP fake dump by agent-2 of $app:1.0.0" ] ||
+  fail "the newly pulled agent did not dump before the version changed: $(as_root cat "$first_dump")"
+[ "$(as_root stat -c '%a %U' "$backups" "$first_dump" | tr '\n' ' ')" = "700 root 600 root " ] ||
+  fail "the dump is not for root only: $(as_root stat -c '%a %U %n' "$backups" "$first_dump")"
+journal_has "$pinned_unit.service" "Database before the update: $first_dump" || fail "the journal does not name the dump"
+pass "an installation first dumps the database with the backup agent, for root only"
+
 # The volume belongs to the unprivileged updater: links it places there must
 # never make the root deploy script write elsewhere.
 canary=$(mktemp)
@@ -266,6 +291,8 @@ eventually 120 status_has '.last.version == "1.0.2" and .last.result == "rolled-
 env_tag_is 1.0.1 || fail ".env has APP_TAG=$(env_tag) after the rollback"
 eventually 30 pinned_revision_is 1.0.1 || fail "the app runs $(pinned_revision) after the rollback"
 status_has '.last.message | test("unhealthy")' || fail "the rollback does not say why: $(status)"
+status_has ".last.message | startswith(\"Database before the update: $backups/$pinned-1.0.1-\")" ||
+  fail "the rollback does not name the dump: $(status)"
 sleep 5
 status_has '.installing == null and .available.failed != null' || fail "the failed version is tried again: $(status)"
 pass "an unhealthy release goes back to the version before and is not tried again"
@@ -280,6 +307,10 @@ eventually 120 status_has '.last.version == "1.0.3" and .last.result == "rolled-
 status_has '.last.message | test("migrate")' || fail "the failed migration is not named: $(status)"
 env_tag_is 1.0.1 || fail ".env has APP_TAG=$(env_tag) after the failed migration"
 pass "a failed migration goes back to the version before"
+if [ "$(dump_count)" != 2 ] || as_root test -e "$first_dump"; then
+  fail "the two newest dumps are not the only ones: $(as_root ls "$backups")"
+fi
+pass "the server keeps the two newest dumps"
 
 pinned_compose exec -T updater updater channel preview > /dev/null || fail "could not switch to preview"
 version 1.0.4-preview.1
@@ -302,7 +333,33 @@ docker image ls "$app" --format "{{.Tag}}" | grep -x 1.0.4-preview.1 > /dev/null
 eventually 15 journal_has "$pinned_unit.service" "rolled-back: 1.0.2" || fail "the journal does not show the rollback"
 pass "older releases are removed, the one before is kept, the journal tells"
 
+printf 'TEST_DUMP=fail\n' >> .env
+version 2.0.1
+eventually 90 status_has '.last.version == "2.0.1" and .last.result == "failed"' || fail "2.0.1 did not fail: $(status)"
+status_has '.last.message == "The database backup before the update failed: pg_dump failed: connection to server failed. 2.0.0 keeps running. To install without it, set UPDATE_BACKUP=off in .env."' ||
+  fail "the failure does not explain the dump: $(status)"
+env_tag_is 2.0.0 || fail ".env has APP_TAG=$(env_tag) after the failed dump"
+pinned_revision_is 2.0.0 || fail "the app runs $(pinned_revision) after the failed dump"
+if [ -n "$(as_root find "$backups" -name '*.partial')" ] || [ "$(dump_count)" != 2 ]; then
+  fail "the failed dump left files: $(as_root ls -a "$backups")"
+fi
+pass "a failed dump stops the installation before anything changed"
+
+printf 'UPDATE_BACKUP="off" # the agent fails\n' >> .env
+pinned_compose exec -T updater updater install 2.0.1 > /dev/null || fail "the manual install of 2.0.1 was refused"
+eventually 90 status_has '.last.version == "2.0.1" and .last.result == "installed"' || fail "2.0.1 did not install: $(status)"
+eventually 15 journal_has "$pinned_unit.service" "UPDATE_BACKUP=off: no database backup" || fail "the journal does not say why there is no dump"
+pass "UPDATE_BACKUP=off installs without a dump"
+
+sed -i '/^TEST_DUMP=/d; /^UPDATE_BACKUP=/d' .env
+sed -i '/^  backup-agent:/,/^volumes:/{/^volumes:/!d}' compose.yaml
+version 2.0.2
+eventually 90 status_has '.last.version == "2.0.2" and .last.result == "installed"' || fail "2.0.2 did not install: $(status)"
+eventually 15 journal_has "$pinned_unit.service" "no backup-agent service" || fail "the journal does not say that there is no agent"
+pass "an app without the backup agent installs without a dump"
+
 as_root sh updater-setup.sh remove > remove.log || fail "remove failed: $(cat remove.log)"
+grep -q "The database dumps before updates stay in $backups" remove.log || fail "remove does not name the dumps: $(cat remove.log)"
 eventually 20 status_has '.mode == "off"' || fail "the updater did not switch off: $(status)"
 pass "remove switches the pinned app off"
 
