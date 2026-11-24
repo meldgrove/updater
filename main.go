@@ -197,7 +197,7 @@ func client(method, path string, body any, field ...string) int {
 	}
 	request, _ := http.NewRequest(method, local()+path, reader)
 	request.Header.Set("Content-Type", "application/json")
-	if token := os.Getenv("API_TOKEN"); token != "" {
+	if token := apiToken(os.Getenv); token != "" {
 		request.Header.Set("Authorization", "Bearer "+token)
 	}
 	response, err := (&http.Client{Timeout: 90 * time.Second}).Do(request)
