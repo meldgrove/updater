@@ -110,7 +110,9 @@ cat > "$deploy.new" << 'EOF'
 #
 # A version is installed by pulling the image, dumping the database, writing
 # the version to the variable VERSION_VARIABLE (from the updater's
-# environment) in the env file, and docker compose up --wait. When that
+# environment) in the env file, and docker compose up --wait. When the
+# request names a digest (the image whose signature the updater checked),
+# the pulled image must be that one, or nothing changes. When that
 # fails, the env file goes back to what it was and the version before starts
 # again; the database stays as the new version left it, and the message
 # names the dump.
@@ -241,6 +243,9 @@ fi
 
 id=$(field id)
 version=$(field version)
+# The image the updater checked; requests of updater 0.2.4 or older, and of
+# apps whose images are not signed, name none.
+digest=$(field digest)
 case $id in '' | *[!0-9a-f]*) echo "The request has no valid id." >&2 && exit 1 ;; esac
 
 progress() { updater host-report progress "$id" "$1" > /dev/null 2>&1 || true; }
@@ -273,6 +278,10 @@ last_error() {
 
 if ! printf '%s\n' "$version" | grep -Eqx '[0-9]+\.[0-9]+\.[0-9]+(-preview\.[0-9]+)?'; then
   finish failed "The updater asked for '$version', which is no version."
+  exit 1
+fi
+if [ -n "$digest" ] && ! printf '%s\n' "$digest" | grep -Eqx 'sha256:[0-9a-f]{64}'; then
+  finish failed "The updater asked for the image '$digest', which is no digest."
   exit 1
 fi
 if ! printf '%s\n' "$variable" | grep -Eqx '[A-Za-z_][A-Za-z0-9_]*'; then
@@ -341,8 +350,17 @@ replace_env() {
   rm -f "$next"
   return 1
 }
-# restart <log>: what docker compose up says, and whether it succeeded.
-restart() { compose "$@" up --detach --wait --wait-timeout 900 --quiet-pull > "$log" 2>&1; }
+# restart <log>: what docker compose up says, and whether it succeeded. With
+# a checked digest, Compose starts the image just checked and pulls no tag
+# again, also for a service with pull_policy: always (where Compose knows
+# up --pull).
+restart() {
+  if [ -n "$digest" ] && compose up --help 2> /dev/null | grep -q -- '--pull'; then
+    compose "$@" up --detach --wait --wait-timeout 900 --quiet-pull --pull missing > "$log" 2>&1
+  else
+    compose "$@" up --detach --wait --wait-timeout 900 --quiet-pull > "$log" 2>&1
+  fi
+}
 
 echo "Installing $target."
 progress pulling
@@ -350,6 +368,16 @@ if ! docker pull --quiet "$target" > "$log" 2>&1; then
   cat "$log" >&2
   finish failed "Could not download $target: $(last_error "$log")"
   exit 1
+fi
+# The tag may have moved since the updater checked the image's signature:
+# then the pulled image is another one, and nothing changes.
+if [ -n "$digest" ]; then
+  pulled=$(docker image inspect --format '{{range .RepoDigests}}{{println .}}{{end}}' "$target" 2> /dev/null | sed -n 's/^.*@//p')
+  if ! printf '%s\n' "$pulled" | grep -Fx "$digest" > /dev/null; then
+    finish failed "The image $target on the registry is not the one whose signature the updater checked ($digest): its tag moved after the check. Nothing was changed. Ask the maintainers."
+    exit 1
+  fi
+  echo "$target is $digest, the image whose signature the updater checked."
 fi
 docker pull --quiet "$updater_image" > /dev/null 2>&1 || echo "Could not pull the updater's image; it keeps the one it has." >&2
 pull_agent "$@"

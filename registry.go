@@ -2,6 +2,8 @@ package main
 
 import (
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -269,17 +271,42 @@ type manifest struct {
 	} `json:"config"`
 }
 
-func (r *Registry) manifest(ctx context.Context, reference string) (manifest, string, error) {
-	var m manifest
-	response, err := r.do(ctx, http.MethodGet, r.base+"/manifests/"+url.PathEscape(reference), manifestTypes)
+var digestPattern = regexp.MustCompile(`^sha256:[0-9a-f]{64}$`)
+
+// get reads a manifest or blob (kind "manifests" or "blobs") of at most
+// limit bytes. Content named by a digest must have that digest.
+func (r *Registry) get(ctx context.Context, kind, reference, accept string, limit int64) ([]byte, *http.Response, error) {
+	response, err := r.do(ctx, http.MethodGet, r.base+"/"+kind+"/"+url.PathEscape(reference), accept)
 	if err != nil || response.StatusCode != http.StatusOK {
 		if response != nil {
 			drain(response)
 		}
-		return m, "", r.describe(r.host+"/"+r.repository+"@"+reference, response, err)
+		return nil, response, r.describe(r.host+"/"+r.repository+"@"+reference, response, err)
 	}
 	defer drain(response)
-	err = json.NewDecoder(io.LimitReader(response.Body, 4<<20)).Decode(&m)
+	data, err := io.ReadAll(io.LimitReader(response.Body, limit+1))
+	if err != nil {
+		return nil, response, fmt.Errorf("The registry broke off sending %s@%s: %v", r.repository, reference, err)
+	}
+	if int64(len(data)) > limit {
+		return nil, response, fmt.Errorf("The registry sent more than %d bytes for %s@%s.", limit, r.repository, reference)
+	}
+	if strings.HasPrefix(reference, "sha256:") {
+		sum := sha256.Sum256(data)
+		if "sha256:"+hex.EncodeToString(sum[:]) != reference {
+			return nil, response, fmt.Errorf("The registry sent other content for %s@%s than its digest names.", r.repository, reference)
+		}
+	}
+	return data, response, nil
+}
+
+func (r *Registry) manifest(ctx context.Context, reference string) (manifest, string, error) {
+	var m manifest
+	data, response, err := r.get(ctx, "manifests", reference, manifestTypes, 4<<20)
+	if err != nil {
+		return m, "", err
+	}
+	err = json.Unmarshal(data, &m)
 	return m, response.Header.Get("Docker-Content-Digest"), err
 }
 
@@ -332,19 +359,111 @@ func (r *Registry) Info(ctx context.Context, reference string) (ImageInfo, error
 }
 
 func (r *Registry) labels(ctx context.Context, digest string) (map[string]string, error) {
-	response, err := r.do(ctx, http.MethodGet, r.base+"/blobs/"+digest, "")
-	if err != nil || response.StatusCode != http.StatusOK {
-		if response != nil {
-			drain(response)
-		}
-		return nil, r.describe(r.host+"/"+r.repository+"@"+digest, response, err)
+	data, _, err := r.get(ctx, "blobs", digest, "", 4<<20)
+	if err != nil {
+		return nil, err
 	}
-	defer drain(response)
 	var config struct {
 		Config struct {
 			Labels map[string]string `json:"Labels"`
 		} `json:"config"`
 	}
-	err = json.NewDecoder(io.LimitReader(response.Body, 4<<20)).Decode(&config)
+	err = json.Unmarshal(data, &config)
 	return config.Config.Labels, err
+}
+
+// descriptor points to a manifest or blob.
+type descriptor struct {
+	MediaType    string `json:"mediaType"`
+	ArtifactType string `json:"artifactType"`
+	Digest       string `json:"digest"`
+}
+
+// referrers lists what refers to an image (OCI 1.1): through the referrers
+// API, or, where the registry answers 404 to that (GHCR), the index under
+// the tag sha256-<hex> (the referrers tag schema). An image without
+// referrers: an empty list.
+func (r *Registry) referrers(ctx context.Context, digest string) ([]descriptor, error) {
+	var index struct {
+		Manifests []descriptor `json:"manifests"`
+	}
+	const indexType = "application/vnd.oci.image.index.v1+json"
+	response, err := r.do(ctx, http.MethodGet, r.base+"/referrers/"+digest, indexType)
+	if err != nil {
+		return nil, r.describe(r.host+"/"+r.repository+"@"+digest, nil, err)
+	}
+	if response.StatusCode == http.StatusOK {
+		defer drain(response)
+		if err := json.NewDecoder(io.LimitReader(response.Body, 4<<20)).Decode(&index); err != nil {
+			return nil, fmt.Errorf("The registry sent a list of referrers that is no JSON: %v", err)
+		}
+		return index.Manifests, nil
+	}
+	drain(response)
+	// A registry without the API answers 404 (OCI); some 400, 405 or 501.
+	switch response.StatusCode {
+	case http.StatusNotFound, http.StatusBadRequest, http.StatusMethodNotAllowed, http.StatusNotImplemented:
+	default:
+		return nil, r.describe(r.host+"/"+r.repository+"@"+digest, response, nil)
+	}
+	tag := strings.Replace(digest, ":", "-", 1)
+	data, response, err := r.get(ctx, "manifests", tag, indexType, 4<<20)
+	if response != nil && response.StatusCode == http.StatusNotFound {
+		return nil, nil
+	}
+	if err != nil {
+		return nil, err
+	}
+	if err := json.Unmarshal(data, &index); err != nil {
+		return nil, fmt.Errorf("The registry sent a list of referrers that is no JSON: %v", err)
+	}
+	return index.Manifests, nil
+}
+
+// Attestations reads the Sigstore bundles that refer to an image, as the
+// release workflow pushes them (actions/attest, push-to-registry): an OCI
+// manifest whose layer is the bundle. None: an empty list.
+func (r *Registry) Attestations(ctx context.Context, digest string) ([][]byte, error) {
+	if !digestPattern.MatchString(digest) {
+		return nil, fmt.Errorf("%s is no image digest", digest)
+	}
+	referrers, err := r.referrers(ctx, digest)
+	if err != nil {
+		return nil, err
+	}
+	var bundles [][]byte
+	for _, referrer := range referrers {
+		if !strings.HasPrefix(referrer.ArtifactType, bundleType) || !digestPattern.MatchString(referrer.Digest) {
+			continue
+		}
+		if len(bundles) == 10 {
+			break
+		}
+		data, _, err := r.get(ctx, "manifests", referrer.Digest, "application/vnd.oci.image.manifest.v1+json", 1<<20)
+		if err != nil {
+			return nil, err
+		}
+		var m struct {
+			Subject *descriptor  `json:"subject"`
+			Layers  []descriptor `json:"layers"`
+		}
+		if err := json.Unmarshal(data, &m); err != nil {
+			return nil, fmt.Errorf("The registry sent an attestation of %s that is no JSON: %v", digest, err)
+		}
+		if m.Subject != nil && m.Subject.Digest != digest {
+			continue // it refers to another image
+		}
+		for _, layer := range m.Layers {
+			if !strings.HasPrefix(layer.MediaType, bundleType) || !digestPattern.MatchString(layer.Digest) {
+				continue
+			}
+			bundle, _, err := r.get(ctx, "blobs", layer.Digest, "", 4<<20)
+			if err != nil {
+				return nil, err
+			}
+			bundles = append(bundles, bundle)
+			break
+		}
+	}
+	return bundles, nil
 }

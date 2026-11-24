@@ -1,0 +1,32 @@
+{
+  "schemaVersion": 2,
+  "mediaType": "application/vnd.oci.image.index.v1+json",
+  "manifests": [
+    {
+      "mediaType": "application/vnd.oci.image.manifest.v1+json",
+      "digest": "sha256:b3b7341a657797204c0d392c9d391fd72052de2097a895d4c18ea0ec0c95c410",
+      "size": 2757,
+      "platform": {
+        "architecture": "amd64",
+        "os": "linux"
+      }
+    },
+    {
+      "mediaType": "application/vnd.oci.image.manifest.v1+json",
+      "digest": "sha256:06ccb0b761a8179a9d5243f9f17d3f0314ea8a066ca862faedf2b11bc003dcb9",
+      "size": 2757,
+      "platform": {
+        "architecture": "arm64",
+        "os": "linux"
+      }
+    }
+  ],
+  "annotations": {
+    "org.opencontainers.image.created": "2026-11-20T14:50:46Z",
+    "org.opencontainers.image.description": "A self-hosted knowledge base of Markdown pages in spaces: staff edit in the browser, AI agents read everything and propose change sets over MCP, editors review and merge. Sign-in with Keycloak or any OpenID Connect provider.",
+    "org.opencontainers.image.revision": "1ac5102058caf7a4af181a0e6eafb6671942fc30",
+    "org.opencontainers.image.source": "https://github.com/meldgrove/handbook",
+    "org.opencontainers.image.title": "Meldgrove Handbook",
+    "org.opencontainers.image.version": "0.2.0"
+  }
+}

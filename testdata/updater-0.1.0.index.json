@@ -1,0 +1,32 @@
+{
+  "schemaVersion": 2,
+  "mediaType": "application/vnd.oci.image.index.v1+json",
+  "manifests": [
+    {
+      "mediaType": "application/vnd.oci.image.manifest.v1+json",
+      "digest": "sha256:eea6ab61e5372f0d241b3cf626a517031901c816d09c9581e7fba791419cc7a4",
+      "size": 862,
+      "platform": {
+        "architecture": "amd64",
+        "os": "linux"
+      }
+    },
+    {
+      "mediaType": "application/vnd.oci.image.manifest.v1+json",
+      "digest": "sha256:3207c97dd49c6f11a7d1fbd17ec46bc129670e07d7ce41cbebff6e9df8380a11",
+      "size": 862,
+      "platform": {
+        "architecture": "arm64",
+        "os": "linux"
+      }
+    }
+  ],
+  "annotations": {
+    "org.opencontainers.image.description": "Redeploys a self-hosted app through its platform's deploy link when the image tag it runs points to a new image.",
+    "org.opencontainers.image.licenses": "Apache-2.0",
+    "org.opencontainers.image.revision": "8219c3abdc0204d34ac06ce7f8f0b0c00a2ffeec",
+    "org.opencontainers.image.source": "https://github.com/meldgrove/updater",
+    "org.opencontainers.image.title": "Meldgrove Updater",
+    "org.opencontainers.image.version": "0.1.0"
+  }
+}

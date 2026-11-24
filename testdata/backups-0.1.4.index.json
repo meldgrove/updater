@@ -1,0 +1,32 @@
+{
+  "schemaVersion": 2,
+  "mediaType": "application/vnd.oci.image.index.v1+json",
+  "manifests": [
+    {
+      "mediaType": "application/vnd.oci.image.manifest.v1+json",
+      "digest": "sha256:8bced8d653dfed099cb129a4d2b47c26d7d751caaee391b864a2b1c619b58640",
+      "size": 3517,
+      "platform": {
+        "architecture": "amd64",
+        "os": "linux"
+      }
+    },
+    {
+      "mediaType": "application/vnd.oci.image.manifest.v1+json",
+      "digest": "sha256:8d1a53321b41dcbe235309a5304cab3f9ce488ddb0816629ccd900d1ec03ce80",
+      "size": 3517,
+      "platform": {
+        "architecture": "arm64",
+        "os": "linux"
+      }
+    }
+  ],
+  "annotations": {
+    "org.opencontainers.image.created": "2026-11-24T10:40:37Z",
+    "org.opencontainers.image.description": "Self-hosted backups of what an organization cannot lose: every Meldgrove app (through its backup agent), Google Drive and Personio, encrypted and deduplicated with restic into S3-compatible storage such as Hetzner Object Storage. Dashboard, schedules, retention, alerts and a recovery kit.",
+    "org.opencontainers.image.revision": "9b605bcb9d0b8bb47615ed836f1092df28a705fb",
+    "org.opencontainers.image.source": "https://github.com/meldgrove/backups",
+    "org.opencontainers.image.title": "Meldgrove Backups",
+    "org.opencontainers.image.version": "0.1.4"
+  }
+}

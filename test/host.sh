@@ -333,6 +333,45 @@ docker image ls "$app" --format "{{.Tag}}" | grep -x 1.0.4-preview.1 > /dev/null
 eventually 15 journal_has "$pinned_unit.service" "rolled-back: 1.0.2" || fail "the journal does not show the rollback"
 pass "older releases are removed, the one before is kept, the journal tells"
 
+# The digest pin: a request that names a digest (from updater 0.2.5, for an
+# app whose images are signed) installs that image only. The test's images
+# carry no signatures, so the test leaves such requests itself, as the
+# updater does.
+registry_digest() {
+  curl --silent --head --header "Accept: application/vnd.oci.image.index.v1+json,application/vnd.docker.distribution.manifest.list.v2+json,application/vnd.oci.image.manifest.v1+json,application/vnd.docker.distribution.manifest.v2+json" \
+    "http://$registry/v2/app/manifests/$1" | tr -d '\r' | sed -n 's/^[Dd]ocker-[Cc]ontent-[Dd]igest: *//p'
+}
+ask() {
+  pinned_compose exec -T updater sh -c "printf 'protocol=2\nid=%s\nversion=%s\ndigest=%s\n' '$1' '$2' '$3' > /trigger/.request && mv /trigger/.request /trigger/deploy"
+}
+journal_count() { as_root journalctl --unit "$pinned_unit.service" --no-pager | grep -c "$1" || true; }
+newest_dump() { as_root find "$backups" -name '*.dump' -printf '%T@ %p\n' | sort -n | tail -n 1; }
+dump_before=$(newest_dump)
+ask 0a1b 2.0.0 sha256:0000000000000000000000000000000000000000000000000000000000000000
+eventually 90 journal_has "$pinned_unit.service" "failed: 2.0.0 (The image $app:2.0.0 on the registry is not the one whose signature the updater checked" ||
+  fail "a request for another digest did not fail"
+env_tag_is 2.0.0 || fail ".env has APP_TAG=$(env_tag) after the refused digest"
+[ "$(newest_dump)" = "$dump_before" ] || fail "the database was dumped before the digest was checked"
+pass "a request whose digest the pulled image does not have fails before the dump and before .env changes"
+digest=$(registry_digest 2.0.0)
+installs=$(journal_count "installed: 2.0.0")
+installed_again() { [ "$(journal_count "installed: 2.0.0")" -gt "$installs" ]; }
+# Docker Compose must start the checked image, without pulling the tag again,
+# also for services with pull_policy: always.
+awk -v image="    image: $app:" 'index($0, image) == 1 { print; print "    pull_policy: always"; next } { print }' compose.yaml > compose.next
+mv compose.next compose.yaml
+# Nanoseconds: the refused request above pulled the tag, maybe in this very
+# second, and docker events counts whole seconds otherwise.
+since=$(date +%s.%N)
+ask 0a1c 2.0.0 "$digest"
+eventually 120 installed_again || fail "a request with the image's digest did not install"
+journal_has "$pinned_unit.service" "$app:2.0.0 is $digest, the image whose signature the updater checked" || fail "the journal does not name the checked digest"
+[ "$(newest_dump)" != "$dump_before" ] || fail "no dump before the installation with a digest"
+pulls=$(docker events --since "$since" --until "$(date +%s.%N)" --filter type=image --filter event=pull --format '{{.Actor.ID}}' | grep -cx "$app:2.0.0" || true)
+[ "$pulls" = 1 ] || fail "the tag $app:2.0.0 was pulled $pulls times during the installation, not once"
+sed -i '/^    pull_policy: always$/d' compose.yaml
+pass "a request with the pulled image's digest installs that image, without pulling the tag again; one without a digest installs as before (above)"
+
 printf 'TEST_DUMP=fail\n' >> .env
 version 2.0.1
 eventually 90 status_has '.last.version == "2.0.1" and .last.result == "failed"' || fail "2.0.1 did not fail: $(status)"

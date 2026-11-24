@@ -41,6 +41,10 @@ type Engine struct {
 	infos        map[string]ImageInfo
 	logged       map[string]time.Time
 	lastMode     string
+
+	signatures *Signatures
+	signature  string                 // required, not-signed, or "" while not known (Status)
+	verdicts   map[string]attestation // digest and repository: a verified signature
 }
 
 // offer is an update the app can show.
@@ -77,9 +81,11 @@ func NewEngine(cfg Config, logf func(string, ...any)) *Engine {
 		hook: &http.Client{Timeout: 60 * time.Second, CheckRedirect: func(*http.Request, []*http.Request) error {
 			return http.ErrUseLastResponse
 		}},
-		requests: make(chan func(context.Context)),
-		infos:    map[string]ImageInfo{},
-		logged:   map[string]time.Time{},
+		requests:   make(chan func(context.Context)),
+		infos:      map[string]ImageInfo{},
+		logged:     map[string]time.Time{},
+		signatures: NewSignatures(cfg.Trigger, cfg.Version),
+		verdicts:   map[string]attestation{},
 	}
 }
 
@@ -300,6 +306,9 @@ func (e *Engine) check(ctx context.Context) {
 		err = e.checkPinned(ctx)
 	} else {
 		err = e.checkTag(ctx)
+	}
+	if err == nil {
+		err = e.updateSignature(ctx)
 	}
 	e.mu.Lock()
 	defer e.mu.Unlock()
@@ -697,7 +706,8 @@ func (e *Engine) autoInstall(ctx context.Context) {
 	if due == nil {
 		return
 	}
-	if err := e.install(ctx, due, false); err != nil {
+	var shown reported
+	if err := e.install(ctx, due, false); err != nil && !errors.As(err, &shown) {
 		e.logf("%s", err.Error())
 	}
 }
@@ -770,6 +780,17 @@ func (e *Engine) install(ctx context.Context, o *offer, manual bool) error {
 		return errors.New("Automatic updates are off on this server, so nothing can install. Set them up as the deployment guide describes.")
 	}
 	e.mu.Lock()
+	installing := e.state.Install
+	e.mu.Unlock()
+	if installing != nil {
+		return fmt.Errorf("%s is being installed.", installing.Version)
+	}
+	// Before anything is asked of the platform or the server.
+	digest, err := e.checkSignature(ctx, o)
+	if err != nil {
+		return err
+	}
+	e.mu.Lock()
 	defer e.mu.Unlock()
 	if e.state.Install != nil {
 		return fmt.Errorf("%s is being installed.", e.state.Install.Version)
@@ -813,6 +834,12 @@ func (e *Engine) install(ctx context.Context, o *offer, manual bool) error {
 			return fmt.Errorf("Cannot keep the state in %s, so nothing is installed: %v", e.cfg.Trigger, err)
 		}
 		request := fmt.Sprintf("protocol=2\nid=%s\nversion=%s\n", id, o.Version)
+		if digest != "" {
+			// The image whose signature was checked: a deploy script of
+			// updater 0.2.5 or later installs nothing else (older ones ignore
+			// the line).
+			request += "digest=" + digest + "\n"
+		}
 		if err := writeAtomic(e.path("deploy"), []byte(request), 0o644); err != nil {
 			e.state.Install = nil
 			e.save()

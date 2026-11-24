@@ -37,6 +37,12 @@ const usage = `Usage: updater [command]
   check             print the digest the image tag points to now
   status            print the running updater's status
   install VERSION   install an offered version now
+  install --unsigned VERSION
+                    install it without checking its signature (only here,
+                    never through the API)
+  verify-image IMAGE[:TAG|@DIGEST] [--repo OWNER/NAME]
+                    check that Meldgrove's release workflow signed the image
+                    (for that repository); exit 0 when it did
   channel [stable|preview]
                     print the channel, or switch to it
   host-setup        print the setup script for a server without a platform
@@ -73,11 +79,25 @@ func run(args []string) int {
 	case "status":
 		return client(http.MethodGet, "/v1/status", nil)
 	case "install":
+		if len(args) == 3 && args[1] == "--unsigned" {
+			trigger := orDefault(os.Getenv("TRIGGER_DIR"), "/trigger")
+			if code := allowUnsigned(trigger, args[2]); code != 0 {
+				return code
+			}
+			fmt.Fprintf(os.Stderr, "updater: %s installs without the check of its signature.\n", args[2])
+			code := client(http.MethodPost, "/v1/install", map[string]string{"version": args[2]})
+			if code != 0 {
+				_ = os.Remove(filepath.Join(trigger, "allow-unsigned"))
+			}
+			return code
+		}
 		if len(args) != 2 {
 			fmt.Fprintln(os.Stderr, usage)
 			return 2
 		}
 		return client(http.MethodPost, "/v1/install", map[string]string{"version": args[1]})
+	case "verify-image":
+		return verifyImage(args[1:], os.Getenv, os.Stdout)
 	case "channel":
 		if len(args) == 1 {
 			return client(http.MethodGet, "/v1/status", nil, "channel")
@@ -212,7 +232,8 @@ func client(method, path string, body any, field ...string) int {
 		fmt.Fprintf(os.Stderr, "updater: unexpected answer: %s\n", data)
 		return 1
 	}
-	if message, ok := answer["error"].(string); ok {
+	// An error answer; a Status also has an error field (the last check's).
+	if message, ok := answer["error"].(string); ok && response.StatusCode >= 300 {
 		fmt.Fprintf(os.Stderr, "updater: %s\n", message)
 		return 1
 	}
@@ -289,3 +310,18 @@ func hostCommand(trigger string, args []string) int {
 }
 
 var projectPattern = regexp.MustCompile(`^[a-z0-9][a-z0-9_-]*$`)
+
+// allowUnsigned writes the operator's permission to install one version
+// without the check of its signature (README.md, "Signatures"). Only a
+// command in the container writes it; the API cannot.
+func allowUnsigned(trigger, version string) int {
+	if version == "" || strings.ContainsAny(version, "\r\n= ") {
+		fmt.Fprintln(os.Stderr, usage)
+		return 2
+	}
+	if err := writeAtomic(filepath.Join(trigger, "allow-unsigned"), []byte("version="+version+"\n"), 0o644); err != nil {
+		fmt.Fprintf(os.Stderr, "updater: %v\n", err)
+		return 1
+	}
+	return 0
+}

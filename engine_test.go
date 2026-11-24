@@ -17,17 +17,47 @@ import (
 )
 
 // fakeRegistry serves tags with index annotations, as GHCR does for images
-// of the Meldgrove release workflow. Anonymous pulls need a token.
+// of the Meldgrove release workflow. Anonymous pulls need a token. Content
+// is addressed by its digest. It can also serve recorded images (a real
+// index) with their Sigstore bundles under the referrers tag sha256-<hex>,
+// as GHCR does.
 type fakeRegistry struct {
-	mu   sync.Mutex
-	tags map[string]string // tag: version annotation
-	head map[string]string // moving tags (latest, 0.2, preview): version they point to
+	mu       sync.Mutex
+	tags     map[string]string   // tag: version annotation
+	head     map[string]string   // moving tags (latest, 0.2, preview): version they point to
+	recorded map[string][]byte   // tag: a recorded index, which wins over tags and head
+	content  map[string][]byte   // digest: a manifest or blob of attestations and recorded images
+	attached map[string][]string // image digest: digests of its attestation manifests
+	failing  map[string]int      // part of a path: the HTTP status it answers
 }
 
-func digestOf(version string) string {
-	sum := sha256.Sum256([]byte(version))
+func newFakeRegistry() *fakeRegistry {
+	return &fakeRegistry{tags: map[string]string{}, head: map[string]string{}, recorded: map[string][]byte{},
+		content: map[string][]byte{}, attached: map[string][]string{}, failing: map[string]int{}}
+}
+
+func sha256Digest(data []byte) string {
+	sum := sha256.Sum256(data)
 	return "sha256:" + hex.EncodeToString(sum[:])
 }
+
+// indexOf is the index the fake registry serves for a version.
+func indexOf(version string) []byte {
+	data, _ := json.Marshal(map[string]any{
+		"schemaVersion": 2,
+		"mediaType":     "application/vnd.oci.image.index.v1+json",
+		"manifests":     []any{},
+		"annotations": map[string]string{
+			"org.opencontainers.image.version":  version,
+			"org.opencontainers.image.revision": fmt.Sprintf("%040x", len(version)*7919),
+			"org.opencontainers.image.created":  "2026-11-10T10:00:00Z",
+			"org.opencontainers.image.source":   "https://github.com/meldgrove/app",
+		},
+	})
+	return data
+}
+
+func digestOf(version string) string { return sha256Digest(indexOf(version)) }
 
 func (f *fakeRegistry) set(tags ...string) {
 	f.mu.Lock()
@@ -41,6 +71,94 @@ func (f *fakeRegistry) point(tag, version string) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	f.head[tag] = version
+}
+
+// record serves a recorded index under a tag; it answers its digest.
+func (f *fakeRegistry) record(tag string, index []byte) string {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.recorded[tag] = index
+	f.content[sha256Digest(index)] = index
+	return sha256Digest(index)
+}
+
+// attach adds a Sigstore bundle to the image at digest, as actions/attest
+// pushes it: a manifest whose layer is the bundle.
+func (f *fakeRegistry) attach(digest string, bundle []byte) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	const bundleType = "application/vnd.dev.sigstore.bundle.v0.3+json"
+	manifest, _ := json.Marshal(map[string]any{
+		"schemaVersion": 2,
+		"mediaType":     "application/vnd.oci.image.manifest.v1+json",
+		"artifactType":  bundleType,
+		"config":        map[string]any{"mediaType": "application/vnd.oci.empty.v1+json", "digest": sha256Digest([]byte("{}")), "size": 2},
+		"layers":        []any{map[string]any{"mediaType": bundleType, "digest": sha256Digest(bundle), "size": len(bundle)}},
+		"subject":       map[string]any{"mediaType": "application/vnd.oci.image.index.v1+json", "digest": digest},
+	})
+	f.content[sha256Digest(bundle)] = bundle
+	f.content[sha256Digest(manifest)] = manifest
+	f.attached[digest] = append(f.attached[digest], sha256Digest(manifest))
+}
+
+// detach removes the attestations of the image at digest.
+func (f *fakeRegistry) detach(digest string) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	delete(f.attached, digest)
+}
+
+// fail makes requests whose path contains part answer status; 0 heals.
+func (f *fakeRegistry) fail(part string, status int) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	if status == 0 {
+		delete(f.failing, part)
+	} else {
+		f.failing[part] = status
+	}
+}
+
+// find answers the content of a tag or digest.
+func (f *fakeRegistry) find(reference string) ([]byte, bool) {
+	if index, ok := f.recorded[reference]; ok {
+		return index, true
+	}
+	if version, ok := f.head[reference]; ok {
+		return indexOf(version), true
+	}
+	if version, ok := f.tags[reference]; ok {
+		return indexOf(version), true
+	}
+	if strings.HasPrefix(reference, "sha256:") {
+		if data, ok := f.content[reference]; ok {
+			return data, true
+		}
+		for _, v := range f.tags {
+			if digestOf(v) == reference {
+				return indexOf(v), true
+			}
+		}
+		for _, v := range f.head {
+			if digestOf(v) == reference {
+				return indexOf(v), true
+			}
+		}
+	}
+	if subject, ok := strings.CutPrefix(reference, "sha256-"); ok {
+		attached := f.attached["sha256:"+subject]
+		if len(attached) == 0 {
+			return nil, false
+		}
+		var manifests []any
+		for _, digest := range attached {
+			manifests = append(manifests, map[string]any{"mediaType": "application/vnd.oci.image.manifest.v1+json", "digest": digest,
+				"size": len(f.content[digest]), "artifactType": "application/vnd.dev.sigstore.bundle.v0.3+json"})
+		}
+		data, _ := json.Marshal(map[string]any{"schemaVersion": 2, "mediaType": "application/vnd.oci.image.index.v1+json", "manifests": manifests})
+		return data, true
+	}
+	return nil, false
 }
 
 func (f *fakeRegistry) serve(t *testing.T) *httptest.Server {
@@ -57,6 +175,12 @@ func (f *fakeRegistry) serve(t *testing.T) *httptest.Server {
 		}
 		f.mu.Lock()
 		defer f.mu.Unlock()
+		for part, status := range f.failing {
+			if strings.Contains(r.URL.Path, part) {
+				w.WriteHeader(status)
+				return
+			}
+		}
 		const prefix = "/v2/meldgrove/app/"
 		path := strings.TrimPrefix(r.URL.Path, prefix)
 		switch {
@@ -68,40 +192,32 @@ func (f *fakeRegistry) serve(t *testing.T) *httptest.Server {
 			for tag := range f.head {
 				list = append(list, tag)
 			}
+			for tag := range f.recorded {
+				list = append(list, tag)
+			}
 			json.NewEncoder(w).Encode(map[string]any{"name": "meldgrove/app", "tags": list})
-		case strings.HasPrefix(path, "manifests/"):
-			reference := strings.TrimPrefix(path, "manifests/")
-			version, ok := f.tags[reference]
-			if moving, isMoving := f.head[reference]; isMoving {
-				version, ok = moving, true
-			}
-			if strings.HasPrefix(reference, "sha256:") {
-				for _, v := range f.tags {
-					if digestOf(v) == reference {
-						version, ok = v, true
-					}
-				}
-			}
+		case strings.HasPrefix(path, "manifests/"), strings.HasPrefix(path, "blobs/"):
+			_, reference, _ := strings.Cut(path, "/")
+			data, ok := f.find(reference)
 			if !ok {
 				w.WriteHeader(http.StatusNotFound)
+				fmt.Fprint(w, `{"errors":[{"code":"MANIFEST_UNKNOWN","message":"manifest unknown"}]}`)
 				return
 			}
-			w.Header().Set("Docker-Content-Digest", digestOf(version))
-			w.Header().Set("Content-Type", "application/vnd.oci.image.index.v1+json")
+			var m struct {
+				MediaType string `json:"mediaType"`
+			}
+			json.Unmarshal(data, &m)
+			w.Header().Set("Docker-Content-Digest", sha256Digest(data))
+			w.Header().Set("Content-Type", orDefault(m.MediaType, "application/octet-stream"))
 			if r.Method == http.MethodHead {
 				return
 			}
-			json.NewEncoder(w).Encode(map[string]any{
-				"mediaType": "application/vnd.oci.image.index.v1+json",
-				"annotations": map[string]string{
-					"org.opencontainers.image.version":  version,
-					"org.opencontainers.image.revision": fmt.Sprintf("%040x", len(version)*7919),
-					"org.opencontainers.image.created":  "2026-11-10T10:00:00Z",
-					"org.opencontainers.image.source":   "https://github.com/meldgrove/app",
-				},
-			})
+			w.Write(data)
 		default:
+			// Referrers too, as on GHCR.
 			w.WriteHeader(http.StatusNotFound)
+			fmt.Fprint(w, `{"errors":[{"code":"MANIFEST_UNKNOWN","message":"manifest unknown"}]}`)
 		}
 	}))
 	t.Cleanup(server.Close)
@@ -142,7 +258,7 @@ type harness struct {
 }
 
 func newHarness(t *testing.T, env map[string]string, published time.Time) *harness {
-	h := &harness{t: t, registry: &fakeRegistry{tags: map[string]string{}, head: map[string]string{}}, trigger: t.TempDir()}
+	h := &harness{t: t, registry: newFakeRegistry(), trigger: t.TempDir()}
 	h.clock = time.Date(2026, 11, 19, 12, 0, 0, 0, time.UTC)
 	registry := h.registry.serve(t)
 	github := fakeGitHub(t, published)
