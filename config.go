@@ -52,7 +52,7 @@ func LoadConfig(getenv func(string) string) (Config, error) {
 		Image:            getenv("IMAGE"),
 		VersionVariable:  getenv("VERSION_VARIABLE"),
 		HookURL:          getenv("DEPLOY_HOOK_URL"),
-		HookToken:        getenv("DEPLOY_HOOK_TOKEN"),
+		HookToken:        strings.TrimSpace(getenv("DEPLOY_HOOK_TOKEN")),
 		CooldownText:     getenv("COOLDOWN"),
 		RegistryUsername: getenv("REGISTRY_USERNAME"),
 		RegistryPassword: getenv("REGISTRY_PASSWORD"),
@@ -60,7 +60,7 @@ func LoadConfig(getenv func(string) string) (Config, error) {
 		GitHubAPI:        orDefault(getenv("GITHUB_API_URL"), "https://api.github.com"),
 		Source:           getenv("SOURCE"),
 		Listen:           orDefault(getenv("LISTEN"), ":8080"),
-		APIToken:         getenv("API_TOKEN"),
+		APIToken:         apiToken(getenv),
 		Trigger:          orDefault(getenv("TRIGGER_DIR"), "/trigger"),
 		Version:          getenv("APP_VERSION"),
 		TimeZone:         orDefault(getenv("TZ"), "UTC"),
@@ -99,6 +99,12 @@ func LoadConfig(getenv func(string) string) (Config, error) {
 		return c, errors.New("DEPLOY_HOOK_URL must start with http:// or https://.")
 	}
 	return c, nil
+}
+
+// apiToken is API_TOKEN without spaces around it, as the apps read
+// UPDATER_TOKEN: a value of only spaces is no token.
+func apiToken(getenv func(string) string) string {
+	return strings.TrimSpace(getenv("API_TOKEN"))
 }
 
 func orDefault(value, fallback string) string {

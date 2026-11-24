@@ -98,7 +98,7 @@ and `DEPLOY_HOOK_TOKEN` ([Coolify](#coolify)).
 | `GITHUB_TOKEN` | Only for release notes of a private repository. |
 | `CHECK_INTERVAL` | Seconds between checks. Default 3600. |
 | `LISTEN` | Address of the API, default `:8080`; `off` switches it off. |
-| `API_TOKEN` | The token the app sends with every API request ([The app's update button](#the-apps-update-button)), such as the output of `openssl rand -base64 32`. Empty: the API takes requests from anything that reaches it. |
+| `API_TOKEN` | The token the app sends with every API request ([The app's update button](#the-apps-update-button)), such as the output of `openssl rand -base64 32`. Spaces around it do not count, as in the apps. Empty (or only spaces): the API takes requests from anything that reaches it. |
 
 ### Debian and similar systems
 

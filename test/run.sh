@@ -120,6 +120,15 @@ answer() { curl --silent --output /dev/null --write-out '%{http_code}' "$@" http
 stop_quickly
 pass "with API_TOKEN, the API refuses requests without the token"
 
+# A token of only spaces is no token, as in the apps, which trim it.
+run --env IMAGE="$app" --env "API_TOKEN=   "
+eventually 20 sh -c 'docker inspect --format "{{.State.Health.Status}}" updater-test | grep -qx healthy' || fail "the container is not healthy with a blank token"
+[ "$(answer)" = 200 ] || fail "the API refused a request although the token is blank"
+[ "$(api status | jq -r .apiToken)" = false ] || fail "apiToken is true for a blank token: $(api status)"
+logged "The API takes requests without a token" || fail "no warning about the API without a token"
+stop_quickly
+pass "a token of only spaces is no token"
+
 # Misconfiguration ends the updater with a message.
 for setting in "IMAGE=$app@sha256:0000" CHECK_INTERVAL=hourly COOLDOWN=soon WINDOW=2-5 WINDOW=02:00-02:00 WINDOW=25:00-03:00 "VERSION_VARIABLE=APP VERSION" "API_TOKEN=two words"; do
   if docker run --rm --env IMAGE="$app" --env "$setting" --env DEPLOY_HOOK_URL=http://127.0.0.1:1/ "$image" > /dev/null 2>&1; then

@@ -693,6 +693,38 @@ func TestAPITokenGuardsEveryRequestButTheHealthCheck(t *testing.T) {
 	}
 }
 
+// The apps trim UPDATER_TOKEN; the updater trims API_TOKEN (and the deploy
+// link's token) the same way, so both sides agree on a blank or padded value.
+func TestTokensAreTrimmed(t *testing.T) {
+	for _, c := range []struct {
+		token, send string
+		apiToken    bool
+	}{
+		{"   ", "", false},
+		{"\t\n", "", false},
+		{" s3cret-token\n", "Bearer s3cret-token", true},
+	} {
+		h := newHarness(t, map[string]string{"API_TOKEN": c.token, "DEPLOY_HOOK_TOKEN": c.token}, time.Time{})
+		h.registry.set("0.2.0")
+		h.engine.start()
+		if s := h.status(); s.APIToken != c.apiToken {
+			t.Errorf("API_TOKEN %q: apiToken = %v, want %v", c.token, s.APIToken, c.apiToken)
+		}
+		if want := strings.TrimPrefix(c.send, "Bearer "); h.engine.cfg.HookToken != want {
+			t.Errorf("DEPLOY_HOOK_TOKEN %q: read as %q, want %q", c.token, h.engine.cfg.HookToken, want)
+		}
+		request := httptest.NewRequest("GET", "/v1/status", nil)
+		if c.send != "" {
+			request.Header.Set("Authorization", c.send)
+		}
+		response := httptest.NewRecorder()
+		h.engine.Handler(context.Background()).ServeHTTP(response, request)
+		if response.Code != 200 {
+			t.Errorf("API_TOKEN %q: the API answered %d to %q", c.token, response.Code, c.send)
+		}
+	}
+}
+
 func call(t *testing.T, handler http.Handler, method, path, body string) *httptest.ResponseRecorder {
 	t.Helper()
 	request := httptest.NewRequest(method, path, strings.NewReader(body))
