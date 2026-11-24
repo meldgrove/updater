@@ -245,26 +245,20 @@ func (s *Signatures) Verify(bundles [][]byte, digest, source string) (attestatio
 	return attestation{}, &signatureError{signatureInvalid, fmt.Sprintf("%s (%v)", reason, invalid)}
 }
 
-// verdict is the answer for a digest that never changes: verified, or
-// invalid.
-type verdict struct {
-	attestation attestation
-	err         error
-}
-
 // reported is an error that the updater has logged and shows in its
 // status already.
 type reported struct{ error }
 
 // verified checks the signature of the image at digest for the repository
-// source; verified and invalid answers are kept.
+// source; a verified answer is kept. Any other is asked again: another
+// bundle may still come.
 func (e *Engine) verified(ctx context.Context, digest, source string) (attestation, error) {
 	key := digest + " " + source
 	e.mu.Lock()
 	known, ok := e.verdicts[key]
 	e.mu.Unlock()
 	if ok {
-		return known.attestation, known.err
+		return known, nil
 	}
 	bundles, err := e.registry.Attestations(ctx, digest)
 	if err != nil {
@@ -274,9 +268,9 @@ func (e *Engine) verified(ctx context.Context, digest, source string) (attestati
 	if err == nil && found.Source == "" {
 		err = &signatureError{signatureInvalid, "its signature names no repository"}
 	}
-	if err == nil || problemOf(err) == signatureInvalid {
+	if err == nil {
 		e.mu.Lock()
-		e.verdicts[key] = verdict{found, err}
+		e.verdicts[key] = found
 		e.mu.Unlock()
 	}
 	return found, err
@@ -386,40 +380,46 @@ func (e *Engine) checkSignature(ctx context.Context, o *offer) (string, error) {
 			return "", e.retry(fmt.Sprintf("%s is not installed yet: %s The updater tries again at the next check.", o.Version, err))
 		}
 	}
+	refusal := ""
 	if _, err := e.verified(ctx, digest, source); err != nil {
 		switch problemOf(err) {
 		case signatureInvalid:
-			return "", e.refuse(o, fmt.Sprintf("%s was not installed: %s. Ask the maintainers.", o.Version, sentence(err)))
+			refusal = fmt.Sprintf("%s was not installed: %s. Ask the maintainers.", o.Version, sentence(err))
 		case signatureMissing:
 			return "", e.retry(fmt.Sprintf("%s is not installed yet: %s. The release workflow signs an image right after it publishes it, so the updater looks again at the next check. If this stays, ask the maintainers.", o.Version, sentence(err)))
 		default:
 			return "", e.retry(fmt.Sprintf("%s is not installed yet: its signature cannot be checked: %s. The updater tries again at the next check.", o.Version, sentence(err)))
 		}
 	}
-	info, err := e.registry.Info(ctx, digest)
-	if err != nil {
-		return "", e.retry(fmt.Sprintf("%s is not installed yet: %s The updater tries again at the next check.", o.Version, err))
-	}
-	// A signed image of another version under this tag, such as an older
-	// release with a known bug, is refused.
-	if pinned && info.Version != o.Version {
-		return "", e.refuse(o, fmt.Sprintf("%s was not installed: its tag points to the signed image of %s. Ask the maintainers.", o.Version, orDefault(info.Version, "no version")))
+	if refusal == "" {
+		info, err := e.registry.Info(ctx, digest)
+		if err != nil {
+			return "", e.retry(fmt.Sprintf("%s is not installed yet: %s The updater tries again at the next check.", o.Version, err))
+		}
+		// A signed image of another version under this tag, such as an older
+		// release with a known bug, is refused.
+		v, ok := ParseVersion(info.Version)
+		switch {
+		case pinned && info.Version != o.Version:
+			refusal = fmt.Sprintf("%s was not installed: its tag points to the signed image of %s. Ask the maintainers.", o.Version, orDefault(info.Version, "no version"))
+		case !pinned && !ok:
+			refusal = fmt.Sprintf("%s was not installed: the signed image that %s points to names no version. Ask the maintainers.", o.Version, e.cfg.Tag)
+		case !pinned && v.Compare(*installed) <= 0:
+			refusal = fmt.Sprintf("%s was not installed: %s points to the signed image of %s, which is not newer than the installed %s. Ask the maintainers.", o.Version, e.cfg.Tag, v.Text, installed.Text)
+		}
 	}
 	if !pinned {
-		v, ok := ParseVersion(info.Version)
-		if !ok {
-			return "", e.refuse(o, fmt.Sprintf("%s was not installed: the signed image that %s points to names no version. Ask the maintainers.", o.Version, e.cfg.Tag))
-		}
-		if v.Compare(*installed) <= 0 {
-			return "", e.refuse(o, fmt.Sprintf("%s was not installed: %s points to the signed image of %s, which is not newer than the installed %s. Ask the maintainers.", o.Version, e.cfg.Tag, v.Text, installed.Text))
-		}
 		// The platform or server pulls the tag itself: it must still point to
-		// the image just checked.
+		// the image just checked. When it moved, the next check looks at the
+		// new image, also before this one counts as failed.
 		if now, err := e.registry.Digest(ctx, e.cfg.Tag); err != nil {
 			return "", e.retry(fmt.Sprintf("%s is not installed yet: %s The updater tries again at the next check.", o.Version, err))
 		} else if now != digest {
 			return "", e.retry(fmt.Sprintf("%s is not installed yet: the tag %s points to another image since the last check. The updater checks that one at the next check.", o.Version, e.cfg.Tag))
 		}
+	}
+	if refusal != "" {
+		return "", e.refuse(o, refusal)
 	}
 	return digest, nil
 }

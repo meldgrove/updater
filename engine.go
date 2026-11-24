@@ -43,8 +43,8 @@ type Engine struct {
 	lastMode     string
 
 	signatures *Signatures
-	signature  string             // required, not-signed, or "" while not known (Status)
-	verdicts   map[string]verdict // digest and repository: a verified or invalid signature
+	signature  string                 // required, not-signed, or "" while not known (Status)
+	verdicts   map[string]attestation // digest and repository: a verified signature
 }
 
 // offer is an update the app can show.
@@ -85,7 +85,7 @@ func NewEngine(cfg Config, logf func(string, ...any)) *Engine {
 		infos:      map[string]ImageInfo{},
 		logged:     map[string]time.Time{},
 		signatures: NewSignatures(cfg.Trigger, cfg.Version),
-		verdicts:   map[string]verdict{},
+		verdicts:   map[string]attestation{},
 	}
 }
 

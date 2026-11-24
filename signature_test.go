@@ -500,3 +500,71 @@ func TestTheReferrersAPI(t *testing.T) {
 		t.Fatalf("bundles = %d, %v", len(bundles), err)
 	}
 }
+
+// Another bundle on the installed image that does not verify does not
+// decide for good: the release workflow's may come after it.
+func TestAnInvalidBundleOnTheInstalledImageIsAskedAgain(t *testing.T) {
+	h := signedHarness(t, nil)
+	digest := h.registry.record("0.2.0", fixture(t, "handbook-0.2.0.index.json"))
+	h.registry.attach(digest, fixture(t, "backups-0.1.4.bundle.json"))
+	h.watch(2)
+	h.engine.start()
+	h.cycle()
+	if s := h.status(); s.Signature == nil || *s.Signature != "not-signed" {
+		t.Fatalf("signature = %v", s.Signature)
+	}
+	h.registry.attach(digest, fixture(t, "handbook-0.2.0.bundle.json"))
+	h.cycle()
+	if s := h.status(); s.Signature == nil || *s.Signature != "required" {
+		t.Fatalf("signature = %v", s.Signature)
+	}
+}
+
+// On a platform, a refusal counts only while the tag still points to the
+// image that was refused.
+func TestAPlatformRefusesOnlyTheImageOfTheTag(t *testing.T) {
+	calls := 0
+	hook := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) { calls++ }))
+	defer hook.Close()
+	h := signedHarness(t, map[string]string{"IMAGE": "REGISTRY/meldgrove/app:latest", "DEPLOY_HOOK_URL": hook.URL}, "0.2.0", "0.2.1", "0.2.2")
+	point := func(version string) { h.registry.record("latest", fixture(t, "handbook-"+version+".index.json")) }
+	point("0.2.1")
+	h.engine.start()
+	h.cycle()
+	point("0.2.0") // older: refused, unless the tag moves on
+	h.engine.check(context.Background())
+	point("0.2.2")
+	h.engine.autoInstall(context.Background())
+	if s := h.status(); calls != 0 || s.Last != nil || len(h.engine.state.Failed) != 0 || s.Error == nil || !strings.Contains(*s.Error, "points to another image") {
+		t.Fatalf("deployments %d, last %+v, failed %v, error %v", calls, s.Last, h.engine.state.Failed, s.Error)
+	}
+	h.cycle()
+	if calls != 1 {
+		t.Fatalf("deployments = %d, status %+v", calls, h.status())
+	}
+}
+
+// Only a registry without the referrers API falls back to the tag schema;
+// other failures stop the check.
+func TestReferrersFailuresStopTheCheck(t *testing.T) {
+	for status, fails := range map[int]bool{404: false, 405: false, 408: true, 500: true, 429: true} {
+		server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			if strings.Contains(r.URL.Path, "/referrers/") {
+				w.WriteHeader(status)
+				return
+			}
+			w.WriteHeader(http.StatusNotFound)
+		}))
+		cfg, err := LoadConfig(func(name string) string {
+			return map[string]string{"IMAGE": strings.TrimPrefix(server.URL, "http://") + "/meldgrove/app:0.2.2"}[name]
+		})
+		if err != nil {
+			t.Fatal(err)
+		}
+		bundles, err := NewRegistry(cfg).Attestations(context.Background(), handbookDigest(t, "0.2.2"))
+		if (err != nil) != fails || len(bundles) != 0 {
+			t.Errorf("HTTP %d: bundles %d, err %v", status, len(bundles), err)
+		}
+		server.Close()
+	}
+}
