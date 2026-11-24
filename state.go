@@ -21,8 +21,11 @@ type State struct {
 	InstalledDigest string            `json:"installedDigest,omitempty"` // following a tag
 	Seen            map[string]int64  `json:"seen,omitempty"`            // version or digest: first seen (unix)
 	Failed          map[string]string `json:"failed,omitempty"`          // version: why it did not install
-	Install         *Install          `json:"install,omitempty"`
-	Last            *Last             `json:"last,omitempty"`
+	// Signed: the repository whose release workflow signed an installed
+	// image; from then on every update must be signed for it.
+	Signed  string   `json:"signed,omitempty"`
+	Install *Install `json:"install,omitempty"`
+	Last    *Last    `json:"last,omitempty"`
 }
 
 // Install is an installation that runs.

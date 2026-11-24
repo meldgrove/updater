@@ -21,8 +21,8 @@ app (admins): update button, Updates settings ─► updater API on the Compose 
 ```
 
 The updater needs no access to Docker: only to the registry, GitHub (release
-notes), and the deploy link or its volume. It is one Go program without
-dependencies and runs as `nobody`.
+notes), Sigstore's TUF repository ([Signatures](#signatures)), and the deploy
+link or its volume. It is one Go program and runs as `nobody`.
 
 ## Channels
 
@@ -123,11 +123,13 @@ touches the updater's volume: it takes the request and reports back with
 `docker exec`, as the updater's own user. For each installation it:
 
 1. takes the version from the updater's request (it accepts nothing but a
-   version number) and the image repository and `VERSION_VARIABLE` from the
-   updater's own configuration;
+   version number, and the image's digest) and the image repository and
+   `VERSION_VARIABLE` from the updater's own configuration;
 2. pulls the image (and the updater's, and the
    [backup agent](https://github.com/meldgrove/backup-agent)'s when the app
-   has the `backup-agent` service);
+   has the `backup-agent` service); when the request names the image whose
+   [signature](#signatures) the updater checked, the pulled image must be
+   that one, or nothing changes;
 3. dumps the database ([Before each installation](#before-each-installation));
 4. saves `.env` and writes the version to `VERSION_VARIABLE`;
 5. runs `docker compose up --detach --wait`: migrations first, then the app,
@@ -247,6 +249,119 @@ nothing installs, and the app still shows new releases to its admins.
 - Read the release notes before a new series (0.3 → 0.4, 1 → 2): it needs
   upgrade steps.
 
+## Signatures
+
+Before it installs a version, the updater checks that Meldgrove's release
+workflow built its image. The
+[release workflow](https://github.com/meldgrove/.github#release-workflow)
+that every Meldgrove repository shares signs a provenance attestation for
+each image of a public repository (SLSA provenance, signed in GitHub Actions
+through Sigstore's public-good instance, stored next to the image on GHCR).
+The updater verifies it with [sigstore-go](https://github.com/sigstore/sigstore-go),
+with the policy of
+`gh attestation verify oci://IMAGE:VERSION --repo meldgrove/<app> --signer-repo meldgrove/.github`:
+
+- the attestation is SLSA provenance for the image's digest;
+- its certificate comes from GitHub Actions
+  (`https://token.actions.githubusercontent.com`) for the workflow
+  `https://github.com/meldgrove/.github/.github/workflows/release.yml` (any
+  ref), and names the same repository as the installed image, such as
+  `https://github.com/meldgrove/handbook`;
+- the image at that digest names the version that is installed
+  (`org.opencontainers.image.version`): the signature covers the image, not
+  its tag, so the tag `0.2.5` pointing to the signed image of `0.2.1` is
+  refused.
+
+**When it applies:** no setting. When the installed image carries a valid
+attestation of the release workflow, every version after it must carry one
+for the same repository; `signature` in the Status is `"required"`, and the
+updater keeps that in its volume, so an attestation removed later does not
+switch the check off. When the installed image carries none (an app whose
+repository is private, such as CRM; an own build; releases signed before
+the shared release workflow), nothing is checked, and `signature` is
+`"not-signed"`.
+
+**When an update does not pass:**
+
+- Its signature does not verify, comes from another workflow or another
+  repository, or its image names another version: it is not installed and
+  counts as failed, like a failed installation. It does not install again
+  automatically; a newer version does. The message says why, such as
+  `0.2.5 was not installed: its signature is not from Meldgrove's release
+  workflow for meldgrove/handbook (…). Ask the maintainers.`
+- Its image carries no attestation: the release workflow publishes an image
+  before it attests it, so for up to a minute a new version has none.
+  Nothing installs, the Status `error` says why, and the updater looks again
+  within a minute.
+- The check cannot run (registry, Sigstore's TUF repository, a bundle format
+  this updater does not know): nothing installs, the Status `error` says
+  why, and the next check tries again. The updater never installs unchecked
+  because a lookup failed.
+
+**What it reads:** the attestation from the registry, with the same
+sign-in (the referrers API, or on GHCR the tag `sha256-<hex>`), and
+Sigstore's trusted root through TUF from `https://tuf-repo-cdn.sigstore.dev`,
+starting from the root of trust built into sigstore-go. The TUF metadata is
+cached in the volume (`/trigger/sigstore`) and read again once a day; when
+the TUF repository does not answer, the cache serves while it is valid
+(about a week). A server whose outgoing connections are limited needs
+`tuf-repo-cdn.sigstore.dev` besides the registry.
+
+**On a server,** the request names the digest whose signature was checked
+(`digest=sha256:…`), and the deploy script installs only that image: when
+the pulled image is another one, the installation fails with "its tag moved
+after the check" before it dumps the database or changes `.env`. Servers
+get this when their host setup is written again from updater 0.2.5 or later
+(as root in the app's folder):
+
+```sh
+docker compose run --rm -T --pull always updater host-setup > updater-setup.sh
+sh updater-setup.sh
+```
+
+Deploy scripts of older host setups ignore the digest and pull the tag. On
+a platform such as Coolify, and with a host setup that follows the tag
+(updater 0.1, or no `VERSION_VARIABLE`), the platform or server pulls the
+tag itself: the updater checks the image the tag points to right before it
+calls the deploy link or asks the server, and the tag could still move in
+between.
+
+**What it protects against:** an image tag overwritten or added on GHCR
+outside the release workflow, for example with a leaked token that may
+write packages. **What it does not:** a compromised release workflow or
+repository (the workflow signs what it builds); the moment between the check
+and the pull on a platform; an installed image whose attestation was
+removed before updater 0.2.5 first looked at it.
+
+**Way out, for the server's operator only:** to install one version without
+the check, run in the app's folder
+
+```sh
+docker compose exec updater updater install --unsigned 0.2.5
+```
+
+It counts for that version, once. The API cannot do this, also not without
+`API_TOKEN`: only a shell on the server can. When the check wrongly refuses
+every version (a fault of the updater), update the updater itself; the
+server pulls the updater's image only during an installation, so an
+updater that installs nothing would otherwise stay:
+
+```sh
+docker compose pull updater && docker compose up -d updater
+```
+
+**Check one image** with the same policy; exit code 0 when it passes:
+
+```sh
+docker run --rm ghcr.io/meldgrove/updater:0.2 verify-image ghcr.io/meldgrove/handbook:0.2.3 --repo meldgrove/handbook
+# signed: ghcr.io/meldgrove/handbook:0.2.3 (sha256:22f0…) is 0.2.3, signed by Meldgrove's release workflow for meldgrove/handbook (…/release.yml@b021c42…).
+```
+
+`IMAGE@sha256:…` checks a digest; without `--repo`, the line names the
+repository. A tag that is a version must point to the signed image of that
+version. `REGISTRY_USERNAME` and `REGISTRY_PASSWORD` sign in to a private
+registry.
+
 ## Your own build
 
 A fork that publishes its own images can use the updater unchanged:
@@ -265,6 +380,8 @@ A fork that publishes its own images can use the updater unchanged:
   Release `vX.Y.Z`, and a preview lists the changes since the installed
   version. `SOURCE` names another repository; `GITHUB_TOKEN` reads a private
   one.
+- Its images carry no signature of Meldgrove's release workflow, so the
+  updater checks none ([Signatures](#signatures)).
 
 ## The app's update button
 
@@ -310,6 +427,7 @@ type Status = {
   window: string | null;                  // e.g. "02:00-05:00"
   timezone: string;
   apiToken: boolean;                      // API_TOKEN is set: the API requires it
+  signature: "required" | "not-signed" | null; // updates must be signed (since 0.2.5); null: not known yet
 };
 
 type Update = {
@@ -345,6 +463,8 @@ Asking the host to install 0.2.4.
   sees it.
 - `docker compose run --rm updater check` prints the digest the tag points to
   now, or why it cannot read it.
+- `docker compose run --rm updater verify-image IMAGE` checks an image's
+  signature ([Signatures](#signatures)).
 
 ## Good to know
 
@@ -371,7 +491,7 @@ Asking the host to install 0.2.4.
 ## Development
 
 ```sh
-go test ./...            # unit tests (Go 1.27; or in docker run golang:1.27-alpine)
+go test ./...            # unit tests (Go 1.27; or in docker run golang:1.27-alpine); signatures from testdata/
 test/run.sh              # end to end against a local registry (Docker)
 sudo test/host.sh        # the host setup with systemd: installs, rollbacks, channels
 ```

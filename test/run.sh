@@ -1,6 +1,7 @@
 #!/usr/bin/env bash
 # End-to-end test of the updater image against a local registry and a fake
-# deploy link. Needs Docker, Python 3, GNU date, and internet access to ghcr.io.
+# deploy link. Needs Docker, Python 3, GNU date, and internet access to ghcr.io
+# and tuf-repo-cdn.sigstore.dev (signatures).
 # Usage: test/run.sh [image]   (without an image, it builds updater:test)
 set -euo pipefail
 cd "$(dirname "$0")/.."
@@ -22,6 +23,8 @@ hook=""
 
 cleanup() {
   docker rm --force updater-test-registry updater-test > /dev/null 2>&1 || true
+  # The updater's TUF cache belongs to its user.
+  docker run --rm --volume "$trigger:/trigger" --entrypoint rm "$image" -rf /trigger/sigstore > /dev/null 2>&1 || true
   [ -z "$hook" ] || kill "$hook" 2> /dev/null || true
   rm -rf "$state" "$trigger"
 }
@@ -285,5 +288,72 @@ eventually 15 sh -c "docker exec updater-test updater status | jq -e '.channel =
   fail "the restarted updater forgot its state: $(api status)"
 stop_quickly
 pass "keeps channel and installation over a restart"
+
+# Signatures: two releases of the updater itself, copied from GHCR with their
+# attestations (their digests stay, so their signatures stay valid), and own
+# builds without one.
+signed=localhost:5555/meldgrove/updater
+copy_image() { python3 -I test/copy_image.py "$@"; }
+copy_image copy meldgrove/updater 0.2.3 "${registry}/meldgrove/updater" > /dev/null
+digest=$(copy_image copy meldgrove/updater 0.2.4 "${registry}/meldgrove/updater")
+# own <version>: an own build under a version tag, without attestation.
+own() {
+  printf 'FROM %s\nLABEL org.opencontainers.image.version=%s\n' "$image" "$1" | docker build --quiet --tag "$signed:$1" - > /dev/null
+  docker push --quiet "$signed:$1" > /dev/null
+}
+
+# The installed release is signed, so every update must be: a signed one
+# installs, and the request pins its digest.
+rm -rf "${trigger:?}"/*
+printf 'protocol=2\nproject=app\n' > "$trigger/watched"
+run --env IMAGE="$signed:0.2.3" --env VERSION_VARIABLE=APP_TAG --volume "$trigger:/trigger"
+eventually 60 grep -sqx version=0.2.4 "$trigger/deploy" || fail "no request for the signed 0.2.4: $(api status)"
+grep -qx "digest=$digest" "$trigger/deploy" || fail "the request does not pin $digest: $(cat "$trigger/deploy")"
+[ "$(api status | jq -r .signature)" = required ] || fail "the status does not require signatures: $(api status)"
+logged "signed by Meldgrove's release workflow for meldgrove/updater" || fail "the requirement was not logged"
+id=$(sed -n 's/^id=//p' "$trigger/deploy")
+rm "$trigger/deploy"
+printf 'id=%s\nversion=0.2.4\nresult=installed\nmessage=\nfinished=%s\n' "$id" "$(date +%s)" > "$trigger/result"
+eventually 10 sh -c "docker exec updater-test updater status | jq -e '.installed == \"0.2.4\"' > /dev/null" || fail "0.2.4 was not installed: $(api status)"
+pass "a signed release installs, and the request names the digest that was checked"
+
+# An own build under the next version tag: nothing installs, the status says
+# why, and the version does not fail (its attestation may still come).
+own 0.2.5
+eventually 30 sh -c "docker exec updater-test updater status | jq -e '.error // \"\" | test(\"0.2.5 is not installed yet: its image carries no signature\")' > /dev/null" ||
+  fail "an unsigned 0.2.5 did not wait: $(api status)"
+[ ! -e "$trigger/deploy" ] || fail "asked to install an unsigned 0.2.5"
+[ "$(api status | jq -r '.available.failed')" = null ] || fail "the unsigned 0.2.5 failed for good: $(api status)"
+pass "an unsigned update waits, and the status says why"
+
+# A signature for another image: the version fails, as a failed installation.
+own 0.2.6
+copy_image attach "${registry}/meldgrove/updater" 0.2.4 0.2.6 > /dev/null
+eventually 30 sh -c "docker exec updater-test updater status | jq -e '.last.version == \"0.2.6\" and .last.result == \"failed\" and (.last.message | startswith(\"0.2.6 was not installed: its signature is not from Meldgrove\") and test(\"workflow for meldgrove/updater \"))' > /dev/null" ||
+  fail "0.2.6 with the signature of 0.2.4 did not fail: $(api status)"
+[ ! -e "$trigger/deploy" ] || fail "asked to install 0.2.6"
+pass "an update with another image's signature fails"
+
+# The operator's way out, once: no digest, no check.
+docker exec updater-test updater install 0.2.6 > /dev/null 2>&1 && fail "installed 0.2.6 from the API"
+docker exec updater-test updater install --unsigned 0.2.6 > /dev/null 2>&1 || fail "install --unsigned failed: $(api status)"
+grep -sqx version=0.2.6 "$trigger/deploy" || fail "no request for 0.2.6: $(cat "$trigger/deploy" 2> /dev/null)"
+! grep -q '^digest=' "$trigger/deploy" || fail "the request without check names a digest"
+[ ! -e "$trigger/allow-unsigned" ] || fail "the permission stays after its use"
+logged "without checking its signature: the server's operator allowed it" || fail "the way out was not logged"
+stop_quickly
+pass "the server's operator installs a version without the check, with install --unsigned"
+
+verify() { docker run --rm --network host "$image" verify-image "$@"; }
+answer=$(verify "$signed:0.2.4" --repo meldgrove/updater) || fail "verify-image did not pass a signed image: $answer"
+[[ $answer == "signed: $signed:0.2.4 ($digest) is 0.2.4, signed by Meldgrove's release workflow for meldgrove/updater "* ]] || fail "verify-image said: $answer"
+answer=$(verify "$signed:0.2.4" --repo meldgrove/backups) && fail "verify-image passed another repository"
+[[ $answer == "not valid: $signed:0.2.4 ($digest): its signature is not from Meldgrove's release workflow for meldgrove/backups "* ]] || fail "verify-image said: $answer"
+answer=$(verify "$signed:0.2.5") && fail "verify-image passed an own build"
+[[ $answer == "not signed: $signed:0.2.5 "* ]] || fail "verify-image said: $answer"
+code=0
+verify "$signed:0.2.5" --nonsense > /dev/null 2>&1 || code=$?
+[ "$code" = 2 ] || fail "verify-image answered $code to an unknown option"
+pass "verify-image passes a signed image, and says why others do not pass"
 
 echo "All tests passed."

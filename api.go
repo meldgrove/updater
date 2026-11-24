@@ -32,6 +32,11 @@ type Status struct {
 	Timezone      string      `json:"timezone"`
 	// APIToken is true when API_TOKEN is set, so the API requires it.
 	APIToken bool `json:"apiToken"`
+	// Signature: "required" when updates must carry a signature of
+	// Meldgrove's release workflow (the installed image does), "not-signed"
+	// when the installed image carries none, so nothing is checked; null
+	// while not known.
+	Signature *string `json:"signature"`
 }
 
 type Installing struct {
@@ -97,6 +102,7 @@ func (e *Engine) Status() Status {
 		Window:        nil,
 		Timezone:      e.cfg.TimeZone,
 		APIToken:      e.cfg.APIToken != "",
+		Signature:     optional(e.signature),
 	}
 	if locked != "" {
 		s.Channel = "stable"

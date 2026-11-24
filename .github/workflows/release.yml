@@ -26,6 +26,7 @@ on:
       - Dockerfile
       - .dockerignore
       - go.mod
+      - go.sum
       - "*.go"
       - host-setup.sh
       - .github/workflows/release.yml
