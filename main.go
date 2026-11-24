@@ -212,7 +212,8 @@ func client(method, path string, body any, field ...string) int {
 		fmt.Fprintf(os.Stderr, "updater: unexpected answer: %s\n", data)
 		return 1
 	}
-	if message, ok := answer["error"].(string); ok {
+	// An error answer; a Status also has an error field (the last check's).
+	if message, ok := answer["error"].(string); ok && response.StatusCode >= 300 {
 		fmt.Fprintf(os.Stderr, "updater: %s\n", message)
 		return 1
 	}
